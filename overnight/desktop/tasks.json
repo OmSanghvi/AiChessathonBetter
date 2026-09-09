@@ -1,0 +1,73 @@
+[
+ {
+  "name": "091-ttkeep",
+  "sed": "s/^TT_KEEP: Final = False$/TT_KEEP: Final = True/"
+ },
+ {
+  "name": "gen-001",
+  "kind": "generate",
+  "games": 3000,
+  "nodes": 5000,
+  "movetime_ms": 40
+ },
+ {
+  "name": "gen-002",
+  "kind": "generate",
+  "games": 3000,
+  "nodes": 5000,
+  "movetime_ms": 40
+ },
+ {
+  "name": "v8-clocktest",
+  "kind": "clocktest",
+  "sed": "s/^HISTORY2: Final = False$/HISTORY2: Final = True/; s/^ROOT_ORDER: Final = False$/ROOT_ORDER: Final = True/; s/^TT_BUCKETS: Final = False$/TT_BUCKETS: Final = True/; s/^QS_CAP: Final = 8$/QS_CAP: Final = 14/; s/^SAFE_BITS: Final = False$/SAFE_BITS: Final = True/; s/^ASPIRATION_WINDOW: Final = 30$/ASPIRATION_WINDOW: Final = 15/; s/^SEE_MAIN: Final = False$/SEE_MAIN: Final = True/"
+ },
+ {
+  "name": "v8-120s",
+  "kind": "switch",
+  "sed": "s/^HISTORY2: Final = False$/HISTORY2: Final = True/; s/^ROOT_ORDER: Final = False$/ROOT_ORDER: Final = True/; s/^TT_BUCKETS: Final = False$/TT_BUCKETS: Final = True/; s/^QS_CAP: Final = 8$/QS_CAP: Final = 14/; s/^SAFE_BITS: Final = False$/SAFE_BITS: Final = True/; s/^ASPIRATION_WINDOW: Final = 30$/ASPIRATION_WINDOW: Final = 15/; s/^SEE_MAIN: Final = False$/SEE_MAIN: Final = True/",
+  "games": 40,
+  "workers": 8,
+  "base_ms": 120000,
+  "openings": "platform",
+  "elo0": -50,
+  "elo1": 50
+ },
+ {
+  "name": "v85-clocktest",
+  "kind": "clocktest",
+  "sed": "s/^LMR_AGGRESSIVE: Final = False$/LMR_AGGRESSIVE: Final = True/; s/^LAZY_ACC: Final = False$/LAZY_ACC: Final = True/; s/^TIME_V5: Final = False$/TIME_V5: Final = True/; s/^PRUNE_V2: Final = False$/PRUNE_V2: Final = True/; s/^SINGULAR: Final = False$/SINGULAR: Final = True/"
+ },
+ {
+  "name": "v85-120s",
+  "kind": "switch",
+  "sed": "s/^LMR_AGGRESSIVE: Final = False$/LMR_AGGRESSIVE: Final = True/; s/^LAZY_ACC: Final = False$/LAZY_ACC: Final = True/; s/^TIME_V5: Final = False$/TIME_V5: Final = True/; s/^PRUNE_V2: Final = False$/PRUNE_V2: Final = True/; s/^SINGULAR: Final = False$/SINGULAR: Final = True/",
+  "games": 40,
+  "workers": 8,
+  "base_ms": 120000,
+  "openings": "platform",
+  "elo0": -50,
+  "elo1": 50
+ },
+ {
+  "name": "v9-clocktest",
+  "kind": "clocktest",
+  "sed": "s/^TIME_V6: Final = False$/TIME_V6: Final = True/; s/^QS_EVAL_CACHE: Final = False$/QS_EVAL_CACHE: Final = True/; s/^ADJUDICATION: Final = False$/ADJUDICATION: Final = True/; s/^HISTORY2_FIX: Final = False$/HISTORY2_FIX: Final = True/; s/^KILLER_CLEAR: Final = False$/KILLER_CLEAR: Final = True/"
+ },
+ {
+  "name": "v9-120s",
+  "kind": "switch",
+  "sed": "s/^TIME_V6: Final = False$/TIME_V6: Final = True/; s/^QS_EVAL_CACHE: Final = False$/QS_EVAL_CACHE: Final = True/; s/^ADJUDICATION: Final = False$/ADJUDICATION: Final = True/; s/^HISTORY2_FIX: Final = False$/HISTORY2_FIX: Final = True/; s/^KILLER_CLEAR: Final = False$/KILLER_CLEAR: Final = True/",
+  "games": 40,
+  "workers": 4,
+  "base_ms": 120000,
+  "openings": "platform",
+  "elo0": -50,
+  "elo1": 50
+ },
+ {
+  "name": "111-singular",
+  "sed": "s/^SINGULAR: Final = False$/SINGULAR: Final = True/",
+  "games": 600
+ }
+]

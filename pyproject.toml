@@ -1,0 +1,31 @@
+[project]
+name = "aichessathon-starter"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["chess==1.11.2"]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = ["mypy>=1.18", "ruff>=0.14"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# Scratch probes written during audits. Not part of the project.
+extend-exclude = ["_*.py", "challengers", "overnight/challengers"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
+ignore = ["N818"]
+
+[tool.mypy]
+strict = true
+files = ["agent.py", "harness", "testing", "tools", "training"]
+
+# pyarrow ships no type stubs. It is training-time tooling that never enters the
+# submission, so this is not worth a stub package.
+[[tool.mypy.overrides]]
+module = ["pyarrow.*"]
+ignore_missing_imports = true

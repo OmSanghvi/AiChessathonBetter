@@ -1,0 +1,3517 @@
+"""The submission entrypoint. The platform imports this file and calls get_move.
+
+An iterative-deepening alpha-beta searcher with a transposition table, MVV-LVA
+move ordering, quiescence search and a learned evaluation: a (768 -> 512)x2 -> 32 -> 1
+network whose first layer is maintained incrementally across make and unmake.
+
+Where the time actually goes, measured per *node* rather than per call -- the
+distinction matters, and getting it wrong sent this project after the wrong
+bottleneck for a while:
+
+    NNUE evaluate        29.4%    7.08 us x 0.617 calls/node
+    accumulator push/pop 15.4%    3.62 us x 0.630
+    board push/pop       14.4%    3.06 us x 0.630
+    move generation      13.4%   23.30 us x 0.151
+    everything else      27.4%
+
+These proportions were measured on the 256-wide net and have not been re-measured
+since the accumulator was widened to 512, which roughly doubles the evaluate and
+push/pop rows in absolute terms. Treat the ordering as current and the percentages
+as indicative. Node rate is about 98 knps single-process on one idle core; figures
+near 29 knps that appear in older commit messages were measured on a contended
+machine and understate it by roughly three times.
+
+Move generation is the most expensive thing per call and only the fourth largest
+per node, because most nodes fall straight through to quiescence or are cut by the
+transposition table or reverse futility before any moves are generated. The
+evaluation is four times cheaper per call and runs four times as often. So the
+evaluation, not the move generator, is the thing worth making fast.
+
+At the depths this reaches, a node doubling is worth roughly 120 Elo (range
+80-190), given a measured effective branching factor near 3.
+
+Three python-chess specifics that this file depends on, all measured:
+
+  * `board._transposition_key()` costs 0.46 us. `chess.polyglot.zobrist_hash()`
+    costs 12 us and `board.fen()` 23 us, so neither can be a transposition key.
+  * `generate_legal_captures()` is ~3x cheaper than full generation, which is what
+    makes quiescence affordable.
+  * `can_claim_threefold_repetition()` costs ~150 us -- 5x a full move generation.
+    It must never appear inside the search; repetition is tracked by hand below.
+
+The rules require that a learned model materially drives move selection. It does:
+every leaf score in the search, and so every move chosen, comes from the network in
+`weights/net.npz`, which was trained from Lichess positions annotated by an existing
+engine -- permitted explicitly, since the ban covers only what ships and runs inside
+the submission. No engine, wrapper, or third-party weights are present.
+"""
+
+# ruff: noqa: E402
+#   The thread-limit variables below are read by OpenMP/BLAS when their shared
+#   libraries load, which happens on `import numpy`. Setting them afterwards is
+#   silently ignored, so they have to precede the imports and the imports are
+#   therefore not at the top of the file. This is the one place that ordering
+#   matters more than the convention.
+import os
+
+# Pin the maths libraries to one thread each, before numpy is imported -- after
+# import the setting is ignored. A referee that runs several games at once puts
+# many agents on the same cores, and a BLAS that helpfully spawns a thread per core
+# in each of them turns a fast engine into a flagging one. The search is
+# single-threaded by design; nothing here wants a thread pool.
+for _var in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+):
+    os.environ.setdefault(_var, "1")
+
+import random
+import sys
+import threading
+import time
+from collections.abc import Hashable, Iterator
+from pathlib import Path
+from typing import Any, Final
+
+import chess
+import chess.polyglot
+import chess.syzygy
+import numpy as np
+import numpy.typing as npt
+
+# The clock INIT_ASYNC measures its ready deadline against: as close to the start of
+# `import agent` as anything in this file can be, so the deadline covers the numba
+# compile, the net load and every import above.
+_IMPORT_T0: Final = time.monotonic()
+
+# --------------------------------------------------------------------------------
+# The learned evaluation
+# --------------------------------------------------------------------------------
+# A (768 -> 256)x2 -> 32 -> 1 network, trained on Lichess positions annotated by an
+# existing engine -- which the rules permit explicitly: "Training data: unrestricted,
+# including positions annotated by an existing engine; the ban covers only what ships
+# and runs inside the submission."
+#
+# Inference is hand-written numpy, not ONNX Runtime. At batch 1, which is all a
+# depth-first search ever asks for, numpy measured ~4x faster: ORT carries a fixed
+# ~12 us dispatch cost that dominates a network this small, and only wins when
+# batching, which alpha-beta cannot do without giving up move ordering.
+#
+# Weights are float32. int16 measured *slower* in numpy because integer paths miss
+# BLAS; quantisation is a C++/SIMD trick that inverts in Python.
+
+_WEIGHTS = np.load(Path(__file__).with_name("weights") / "net.npz")
+_W1_RAW: Final = np.ascontiguousarray(_WEIGHTS["W1"], dtype=np.float32)  # (K * 768, A)
+B1: Final = np.ascontiguousarray(_WEIGHTS["b1"], dtype=np.float32)   # (A,)
+ACC_SIZE: Final = _W1_RAW.shape[1]
+FEATURES: Final = 768
+
+# King zones: W1 holds one 768-row block per zone of the perspective's own king, so
+# the same piece on the same square can mean something different when the king is
+# castled short, castled long or still in the centre. The zone is a property of
+# the king's square seen from its own side (mirrored for black), and the first-layer
+# index is `zone * 768 + feature`. A one-zone file is the old layout, unchanged.
+KING_ZONES: Final = int(_W1_RAW.shape[0]) // FEATURES
+# MIRRORED: files e-h are reflected onto a-d for a perspective whose own king stands on
+# them, so one zone covers two mirror-equivalent king squares and sees twice the data.
+# `export.py` has always stamped this flag; until training/check_nnue.py grew a guard,
+# nothing read it, and a mirrored net would have scored nonsense on half the board in
+# silence. A feature index is zone*768 + half + piece*64 + square and every stride is a
+# multiple of 8, so XORing the index by 7 flips exactly the square's file.
+MIRRORED: Final = bool(int(_WEIGHTS["mirrored"])) if "mirrored" in _WEIGHTS.files else False
+# W1 gains a second half holding the file-reflected copy of every row, so a perspective
+# whose own king stands on files e-h is served by `zone + KING_ZONES` instead of by XORing
+# every feature index. That turns the reflection into an ADDITION to the zone offset -- a
+# value the compiled kernels already take as a parameter -- so `fastboard.py` and
+# `fastsearch.py` need no signature change and no new logic to play a mirrored net.
+# A row index is zone*768 + half + piece*64 + square and 768 is a multiple of 8, so row^7
+# flips exactly the square's file; verified over every zone, half, piece and square.
+# Costs 25 MB of resident float32 and nothing on disk.
+W1: Final = (
+    np.ascontiguousarray(
+        np.concatenate([_W1_RAW, _W1_RAW[np.arange(_W1_RAW.shape[0]) ^ 7]])
+    )
+    if MIRRORED
+    else _W1_RAW
+)
+
+if MIRRORED and KING_ZONES != 16:
+    # Deliberately fatal, and it has to be here rather than in the exporter. fastboard.zone_of
+    # hardcodes the folded 16-zone map when mirrored and adds `zones` for the reflected half,
+    # so the reflected half comes out at `15 + zones` no matter what KING_ZONES says. With 8
+    # zones that is block 23 into a W1 holding 16, and refresh() reads off the end of it --
+    # roughly 12288 rows x 512 floats past the last valid one. numba compiles with bounds
+    # checking off, so that is a SIGSEGV, not an exception anything here could catch. Measured on
+    # a kz8 mirrored net: imports clean, prints "compiled board: on", disagrees with a full
+    # rebuild on 3 of 3 positions. Loud failure beats silent nonsense.
+    raise RuntimeError(
+        f"mirrored nets require KING_ZONES == 16, not {KING_ZONES}: "
+        "fastboard.zone_of's folded map is fixed at 16"
+    )
+
+
+# ROOT_LMR: the root loop searches every root move at full depth. The kernel contains
+# root-capable LMR, but `choose`'s Python loop never reaches it, so late root moves --
+# which the ordering has already judged unlikely -- cost as much as the best move.
+# Measured on THIS code, fixed depth 8, 16 positions, driven through the real choose()
+# loop (not root_search, which applies kernel LMR/RFP/NMP at ply 0 and so measures a tree
+# 1.94x smaller than the engine plays): 928,953 -> 559,703 nodes, -39.7%. Root best move
+# changes on 4 of 16 positions: three of those four get BETTER (+5, +16, +1 cp) and one
+# worse (-8). Summed over all 16 the net is +58 cp, against -13 cp of losses spread over
+# positions mostly outside those four. So this is a real behavioural delta that is, on this
+# sample, mildly positive -- not free depth, and 16 positions is not evidence of strength.
+# Only a match can settle it, and see the TIME_V6 note before running one.
+# A reduced search that beats alpha is re-searched at full depth, so a move can only be
+# missed the way ordinary LMR can miss one, never scored wrongly: alpha is the running
+# maximum, so any value worth recording is > alpha and forces the full-depth re-search.
+ROOT_LMR: Final = False
+ROOT_LMR_MIN_MOVE: Final = 4     # first root move index eligible for reduction
+ROOT_LMR_DEEP_MOVE: Final = 10   # from here the reduction is 2 plies
+ROOT_LMR_MIN_DEPTH: Final = 3    # never reduce in a shallow iteration
+
+
+# HISTORY_V2: the butterfly history table is numerically dead as shipped. The bonus is
+# min(depth*depth, 1200) against HISTORY_MAX = 16384, so the gravity term
+# `h * bonus // HISTORY_MAX` is 0 for every realistic pair (h~1000, bonus~9 gives
+# 9000 // 16384 = 0) and the table is a plain unbounded counter. Measured over full
+# depth-10 searches it reaches max ~2317 and min ~-99, so BOTH consumers of it are
+# unreachable: the LMR history step needs |hist| > 8000 and the PRUNE_V2 quiet cut needs
+# hist < -1500. Neither has ever fired in a shipped game. This raises one update to ~15%
+# of the table's range and moves the two thresholds onto the new scale, which also makes
+# a CONT_HIST retest meaningful -- its divisor of 6000 was likewise never reached.
+# Measured through the real choose() loop, depth 8, 16 positions: the bonus rescale ALONE
+# costs +1.2% nodes -- gravity now saturates the top of the table, so the best quiets tie at
+# the cap and lose ordering resolution the old unbounded counter had. All of the value is in
+# HIST_PRUNE_SLOPE_V2, which the working table finally reaches: -13.6% at 1000, 15/16 root
+# best moves -- but that peak is an ARTEFACT and 1000 is not a tuned optimum: at depth 7 the
+# curve is monotone and 600 is best, on 16 different positions 1200 beats 1000 and 600 wins
+# by 12 points, and on the original 16 a single position swings +16,401 nodes between 1000
+# and 800, which manufactures the peak by itself. The only robust finding is the DIRECTION:
+# a lower slope prunes more. 1000 is a conservative point on that line, not a summit.
+# The LMR step stays at 8000 -- note it is NOT dead under V2, where the table reaches +16k
+# and the positive arm fires on 15 of 16 positions; lowering it merely costs nodes.
+# Do NOT enable this with CONT_HIST: at fastsearch.py's `adj` term a rescaled
+# butterfly saturates the +/-2 clamp on its own, so the result would measure butterfly, not
+# continuation history.
+HISTORY_V2: Final = False
+
+
+def _block(zone: int, flip: int) -> int:
+    """The W1 block for a perspective: its zone, or the reflected copy of that zone."""
+    return zone + KING_ZONES if flip else zone
+
+
+def _mirror_flip(square: int) -> int:
+    """0, or 7 when this perspective's own king sits on files e-h."""
+    return 7 if (square & 7) >= 4 else 0
+
+
+def _zone(square: int) -> int:
+    """Zone of a king on `square`, from its own side, for this net's zone count.
+
+    Mirrors `training.features.king_zone` exactly; check_nnue compares all 64.
+    """
+    rank = square >> 3
+    file = square & 7
+    if KING_ZONES == 4:
+        if rank <= 1:
+            return file >> 2
+        return 2 if rank <= 3 else 3
+    if KING_ZONES == 8:
+        if rank <= 1:
+            return file >> 1
+        if rank <= 3:
+            return 4 + (file >> 2)
+        return 6 + (file >> 2)
+    if KING_ZONES == 16 and MIRRORED:
+        # `square` has already had _mirror_flip applied, so its file is a-d.
+        if rank <= 1:
+            return rank * 4 + file
+        if rank <= 3:
+            return 8 + (rank - 2) * 2 + (file >> 1)
+        return 12 + ((rank - 4) >> 1) * 2 + (file >> 1)
+    if KING_ZONES == 16:
+        if rank <= 1:
+            return file
+        if rank <= 3:
+            return 8 + (file >> 1)
+        return 12 + (file >> 1)
+    if KING_ZONES == 32:
+        if rank <= 1:
+            return rank * 8 + file
+        if rank <= 3:
+            return 16 + (rank - 2) * 4 + (file >> 1)
+        return 24 + ((rank - 4) >> 1) * 4 + (file >> 1)
+    return 0
+
+
+def _stacked(name: str) -> npt.NDArray[np.float32]:
+    """A head matrix with a leading bucket axis, whichever layout the file has.
+
+    A single-head file stores W2 as (2A, H); a bucketed one as (B, 2A, H). Both
+    are read into the bucketed shape so there is exactly one evaluation path.
+    """
+    array = np.ascontiguousarray(_WEIGHTS[name], dtype=np.float32)
+    matrix = name in ("W2", "W3")
+    single = array.ndim == (2 if matrix else 1)
+    if single:
+        array = array[None]
+    return np.ascontiguousarray(array)
+
+
+# Output buckets: independent heads after the shared accumulator, selected by the
+# number of pieces on the board. One shared head scored four different KQvK
+# positions within 120 cp of each other and could not convert; a head that only
+# ever sees few-piece positions has the capacity to tell them apart. Costs nothing
+# at inference: one head's matrices are picked, and the same kernel runs.
+W2: Final = _stacked("W2")   # (B, 2A, 32)
+B2: Final = _stacked("b2")   # (B, 32)
+W3: Final = _stacked("W3")   # (B, 32, 1)
+B3: Final = _stacked("b3")   # (B, 1)
+BUCKETS: Final = int(W2.shape[0])
+
+
+def _bucket(pieces: int) -> int:
+    """Which head scores a position with `pieces` men on the board, 1..32.
+
+    Mirrors `bucket_of` in training/train.py exactly. training/check_nnue.py
+    compares the engine against the torch model on positions spanning every
+    band, so a disagreement here fails loudly.
+    """
+    bucket = (pieces - 1) * BUCKETS // 32
+    return 0 if bucket < 0 else (BUCKETS - 1 if bucket >= BUCKETS else bucket)
+
+# The network predicts a win-probability logit; centipawns are that times 400.
+# Getting this constant wrong scales the whole evaluation silently.
+#
+# 400 is not an arbitrary number: training/train.py's loss is
+# (sigmoid(prediction) - sigmoid(target_cp / 400))**2, so a net that fitted its
+# labels perfectly satisfies cp = 400 * logit by construction and OUTPUT_SCALE is
+# that same SCALE read backwards. A net that is merely good does not, and the
+# direction of the miss is predictable rather than a guess: squared error in
+# PROBABILITY space is nearly flat once |logit| is past ~2, so the training signal
+# barely charges the net for an over-extreme logit and it drifts wide.
+#
+# It does. Measured on 1,540 positions drawn from our own 54 platform games
+# (overnight/pgn/platform), stratified evenly over seven piece-count bands, no
+# positions in check, Stockfish depth 13 as the reference, mates dropped and
+# |cp| <= 1000 -- mean absolute error of `scale * logit` against that reference:
+#
+#     scale     200    250    280    300    330    360    400    450
+#     v10      84.7   77.7   76.7   77.6   82.3   89.9  102.7  120.5
+#     v11      82.8   76.9   77.7   80.2   85.8   94.2  107.4  125.5
+#
+# The minimum is near 255-265 and 400 costs 40% more error than the minimum. That
+# is not a curve fitted to noise: split in half at random, the scale fitted on one
+# half scores 76.6-77.2 on the other, against 104.6-110.2 for 400, and the same
+# holds for the previous net (best ~270-280). Both nets are over-dispersed by about
+# 1.5x; the mirrored one is very slightly worse (255-265 against 270-280).
+#
+# This is not a cosmetic constant, because every fixed centipawn margin in the
+# search is compared against a number this scale produced -- RFP_MARGIN 80,
+# FUTILITY_MARGIN, RAZOR_MARGIN, DELTA_MARGIN, BIG_DELTA, the aspiration window,
+# the singular margin, CONTEMPT's 10/25/50, ADJ_WINDOW, and ENDGAME_SHRINK's blend
+# against material. An eval 1.5x too wide is arithmetically the same thing as every
+# one of those margins being 1.5x too tight, so the search prunes on thresholds it
+# was never tuned for.
+#
+# Be careful what this does NOT say. It does not explain the v10 -> v11 regression:
+# BOTH nets have it, to within a whisker, and a depth-controlled comparison of the
+# two shows v11 using 0.97x v10's nodes at depth 8 and 1.12x at depth 10 -- i.e.
+# the mirrored net does not prune MORE per ply, so "over-confident eval buys extra
+# depth on worse guidance" is not the mechanism. This is a standing defect in the
+# engine that the calibration work happened to uncover, not the cause of anything.
+#
+# EVAL_SCALE is deliberately not set to the fitted 260. That value minimises squared
+# error against Stockfish, and an alpha-beta search does not want a minimum-error
+# eval so much as one whose scale agrees with the margins it is compared against;
+# cutting the scale by 35% widens every margin above by 1.54x in true centipawns and
+# will cost depth. 300 is a 25% cut, inside the upper half of the fitted range, which
+# widens them by 1.33x without turning the pruning off. Judged by testing.mistakes.
+EVAL_SCALE: Final = False
+EVAL_SCALE_VALUE: Final = 300.0
+OUTPUT_SCALE: Final = EVAL_SCALE_VALUE if EVAL_SCALE else 400.0
+
+# EVAL_SCALE_PHASE: one scale per output bucket rather than one for the whole game,
+# because the miss is not uniform. Same corpus and same reference as above; the scale
+# here is the one that MINIMISES mean absolute error against Stockfish inside each
+# bucket, swept on a 5 cp grid, which is a better-behaved estimator than the
+# regression slope (an OLS slope is attenuated by however noisy that bucket is, and
+# the noise differs threefold across the eight):
+#
+#   bucket  pieces   n    v10 best   v11 best   v11 MAE at best   at 400   at flat 250
+#     0      3-4     58      215        220           57.8        137.3       63.8
+#     1      5-8    141      270        255           41.6         97.0       41.6
+#     2      9-12   207      295        275           98.0        168.9      101.0
+#     3     13-16   212      285        270           95.5        121.2       96.4
+#     4     17-20   216      295        270           80.9        104.5       81.8
+#     5     21-24   220      285        250           93.6        112.7       93.6
+#     6     25-28   217      140        200           66.6         80.1       67.7
+#     7     29-32   216      115        125           45.0         58.7       48.2
+#
+# The opening heads want a scale barely half the middlegame heads'. The eight output
+# heads were trained independently and nothing in the loss tied their output scales
+# together, so this is what one would expect -- but it means a fixed 80 cp margin
+# means two different things at move 5 and move 40, which the search cannot see.
+#
+# Be honest about how much this is worth: over the whole corpus the shaped table
+# scores MAE 75.6 against 76.9 for the best flat scale and 107.4 for 400. Nearly all
+# of the available gain is in the LEVEL, not the SHAPE -- 1.7% more, for a table
+# that has to be right about every bucket. It ships behind its own switch so the
+# two can be told apart, not because the static error argues for it.
+#
+# The hazard is a discontinuity at a bucket boundary: a capture taking the board from
+# 25 to 24 men would cross a 30% step and manufacture a phantom bonus for trading. So
+# the table is interpolated linearly between bucket midpoints and indexed by piece
+# count directly, which spreads that step over four captures instead of one. Costs
+# one float64 load and no branch per evaluation.
+#
+# EVAL_SCALE_PHASE SUPERSEDES EVAL_SCALE rather than composing with it: the table is
+# already at its own fitted level (mean 253), so applying both would rescale twice.
+EVAL_SCALE_PHASE: Final = False
+# MAE-optimal scale for the SHIPPED net, per output bucket, from the table above.
+EVAL_SCALE_PHASE_FIT: Final = (220.0, 255.0, 275.0, 270.0, 270.0, 250.0, 200.0, 125.0)
+
+# EVAL_SCALE_SMOOTH: the same correction as a three-parameter curve in piece count
+# instead of eight independent per-bucket numbers. Two measurements argue for it.
+#
+# 1. The eight per-bucket numbers are mostly not measurable. On the 1,493 non-mate
+#    corpus positions the three standard estimators of "the scale that fits this
+#    bucket" -- the regression slope cov/var, the ratio of standard deviations, and
+#    the inverse regression -- agree in the endgame and diverge wildly in the opening,
+#    because that is where the net's logit stops correlating with the reference:
+#
+#      bucket  pieces   n   cov/var   sd ratio   inverse   corr(logit, cp)
+#        0      1-4     59     193       206       221         0.935
+#        1      5-8    143     238       248       258         0.962
+#        2      9-12   209     249       271       298         0.915
+#        3     13-16   213     280       327       397         0.843
+#        4     17-20   216     277       336       400         0.833
+#        5     21-24   220     215       325       490         0.671
+#        6     25-28   217     164       395       943         0.425
+#        7     29-32   216     148       324       661         0.490
+#
+#    A 6x spread between estimators in bucket 6 is not a scale that has been measured;
+#    it is regression dilution. A 1,000-sample bootstrap of the cov/var estimate says
+#    the same thing -- a 90% interval of [122, 215] for bucket 6 and [79, 239] for
+#    bucket 7 against [223, 257] for bucket 1. Eight free parameters spend their
+#    freedom on the four bands where the data cannot pin them down.
+#
+# 2. Out of sample the extra parameters buy nothing. Repeated 5-fold cross-validation
+#    (20 shuffles, refitting inside each fold, mean absolute error on the held-out
+#    fold): a single constant scores 78.20, a quadratic in piece count 77.16, and the
+#    eight-parameter step 77.93 -- WORSE than the constant, which is what overfitting
+#    looks like. For reference an unfitted flat 270 scores 77.84 and the shipped 400
+#    scores 110.99. The whole shape is worth about 1 cp of the 33 cp that the level is
+#    worth.
+#
+# So the curve below is fitted on the same corpus and the same MAE criterion as
+# EVAL_SCALE_PHASE, but with three parameters rather than eight:
+#
+#   scale(pieces) = clip(a + b*q + c*q^2, 150, 300),  q = (pieces - 16) / 16
+#
+# fitted by iteratively reweighted least squares (an L1 fit, matching the criterion).
+# In-sample it is indistinguishable from the eight-parameter table -- MAE 76.33
+# against 76.42 for EVAL_SCALE_PHASE's interpolation and 76.22 for the raw step --
+# and out of sample it is the only shape that beats a constant.
+#
+# The floor of 150 is not cosmetic. The curve is extrapolating exactly where the
+# corpus says the slope is unidentified (p >= 30, corr 0.49), and unclamped it falls
+# to 129 at 32 men; the clamp stops a fit from making the opening evaluation
+# arbitrarily quiet on the strength of noise. The ceiling never binds (peak 275).
+#
+# What this actually buys over a step table is boundary behaviour. Measured on the
+# corpus, evaluating the SAME position under its own output head and under the head
+# one bucket up -- the phantom score change a boundary-crossing capture already
+# produces today with a flat scale -- gives a mean |change| of 14.3 cp at 25->24 men,
+# 18.9 at 21->20 and 17.0 at 29->28. The heads are nearly continuous there. A step
+# scale multiplies that: the per-capture rescale ratio at each boundary is
+#
+#   pieces      25->24   29->28    worst
+#   step table   1.250    1.600    1.600
+#   EVAL_SCALE_PHASE (interpolated)
+#                1.057    1.122    1.122
+#   this curve   1.043    1.076    1.076
+#
+# and 1.600 on a +300 cp position is a phantom +180 cp for making one capture, five
+# times the largest discontinuity the engine has today, at a piece count the search
+# crosses constantly. 1.076 is +23 cp, the same order as the head change already
+# there. Note that NO piece-count-dependent scale is free of this: a positive rescale
+# that depends only on piece count cannot reorder moves that leave the same material,
+# so its only effects are (a) exactly this trading bias and (b) making every fixed
+# centipawn margin phase-dependent. Smoothness does not remove the total bias across
+# a game, it spreads it over every capture instead of concentrating it at seven.
+#
+# EVAL_SCALE_SMOOTH SUPERSEDES both EVAL_SCALE and EVAL_SCALE_PHASE: like the phase
+# table it is already at its own fitted level, so composing would rescale twice.
+EVAL_SCALE_SMOOTH: Final = False
+# (a, b, c) in q = (pieces - 16) / 16, then the (floor, ceiling) the curve is clipped to.
+EVAL_SCALE_SMOOTH_FIT: Final = (273.43, -24.18, -120.24)
+EVAL_SCALE_SMOOTH_CLIP: Final = (150.0, 300.0)
+
+
+def _piece_scale_table() -> npt.NDArray[np.float64]:
+    """The output scale for a position with 0..32 men. Flat unless EVAL_SCALE_PHASE.
+
+    Built once at import and read by both forward passes; fastsearch.py builds the
+    same table from the same numbers and testing/check_fastsearch compares the two,
+    so they cannot drift apart in silence.
+    """
+    if EVAL_SCALE_SMOOTH:
+        # Same expression, character for character, in fastsearch.py; check_fastsearch
+        # compares the two arrays, so a divergence fails the gate rather than the game.
+        q = (np.arange(33, dtype=np.float64) - 16.0) / 16.0
+        a, b, c = EVAL_SCALE_SMOOTH_FIT
+        lo, hi = EVAL_SCALE_SMOOTH_CLIP
+        return np.clip(a + b * q + c * q * q, lo, hi)
+    if not EVAL_SCALE_PHASE:
+        return np.full(33, OUTPUT_SCALE, dtype=np.float64)
+    if len(EVAL_SCALE_PHASE_FIT) != BUCKETS:
+        raise RuntimeError(
+            f"EVAL_SCALE_PHASE_FIT has {len(EVAL_SCALE_PHASE_FIT)} entries for "
+            f"{BUCKETS} output buckets: the table was fitted to a different net"
+        )
+    fit = np.asarray(EVAL_SCALE_PHASE_FIT, dtype=np.float64)
+    # _bucket maps `pieces` to (pieces - 1) * BUCKETS // 32, so bucket k covers
+    # 32*k/BUCKETS + 1 upward and its midpoint is half a band above that.
+    width = 32.0 / BUCKETS
+    mids = np.array([width * k + width / 2.0 + 0.5 for k in range(BUCKETS)])
+    counts = np.arange(33, dtype=np.float64)
+    return np.interp(counts, mids, fit).astype(np.float64)
+
+
+PIECE_SCALE: Final = _piece_scale_table()
+
+# --------------------------------------------------------------------------------
+# Endgame tablebase
+# --------------------------------------------------------------------------------
+# The complete 3- and 4-man Syzygy set, 70 files and 4.35 MB. Explicitly permitted:
+# Books and tablebases are permitted as shipped data within the size cap, and
+# chess.polyglot and chess.syzygy are in the base image. The repo's own docs give
+# that cap as 200 MB; a review reading the live rules put it at 50 MB. The exact
+# wording is not reproduced here because it could not be confirmed from a source in
+# this repo -- and it does not matter, because the whole submission is 15.9 MB.
+# Original note, retained for context:
+# "Books and tablebases: permitted as shipped data within the cap;
+# chess.polyglot and chess.syzygy are in the base image."
+#
+# This is here because the network cannot convert won endgames. It scores four very
+# different KQvK positions at +1260, +1175, +1144 and +1241, so the search has no
+# gradient to follow and shuffles until the referee claims a draw -- it drew KQ vs K
+# in testing. No amount of further training fixes that; exact data does.
+#
+# Five men is deliberately not shipped: 378 MB of WDL alone, nearly twice the whole
+# cap, for a published gain of roughly +2 Elo even to Stockfish.
+_TABLEBASE: chess.syzygy.Tablebase | None = None
+try:
+    _syzygy_path = Path(__file__).with_name("weights") / "syzygy"
+    if _syzygy_path.is_dir():
+        _TABLEBASE = chess.syzygy.open_tablebase(str(_syzygy_path))
+except Exception:
+    _TABLEBASE = None
+
+TB_MEN: Final = 4
+# Above any evaluation the net can produce, below MATE_THRESHOLD so a tablebase win
+# is never mistaken for a forced mate the search actually found.
+TB_WIN: Final = 20_000
+
+# --------------------------------------------------------------------------------
+# Opening book
+# --------------------------------------------------------------------------------
+# Twenty plies of human opening moves, counted by frequency from Lichess games and
+# stored as Polyglot. Permitted as shipped data alongside the tablebase, and
+# `chess.polyglot` is in the base image.
+#
+# The clock is the main reason it is here. `_budget` allocates by expected moves
+# remaining, which front-loads: roughly 40 seconds of a 120 second clock goes into
+# the first ten moves, a phase where theory already has the answer and a depth-6
+# search is guessing. The book answers instantly and banks that time for the
+# middlegame, which is close to a node doubling where games are actually decided.
+#
+# Moves are chosen weighted-random rather than always-best. Two agents playing
+# deterministically from the standard position replay one identical game, so a
+# repeat pairing would repeat the result; sampling by popularity keeps the opening
+# sound while making the games different.
+_BOOK: chess.polyglot.MemoryMappedReader | None = None
+try:
+    _book_path = Path(__file__).with_name("weights") / "book.bin"
+    if _book_path.is_file():
+        _BOOK = chess.polyglot.open_reader(str(_book_path))
+except Exception:  # a missing or broken book must never stop play
+    _BOOK = None
+
+# Ignore moves played far less often than the position's best: frequency data has a
+# long tail, and the rare end of it is other people's mistakes.
+BOOK_MIN_SHARE: Final = 0.08
+# Anything at or above this is a distance-carrying score and must be rebased when
+# it crosses the transposition table. That includes tablebase scores, not just
+# mates -- they are ply-relative for exactly the same reason.
+DISTANCE_THRESHOLD: Final = 19_000
+
+_RANDOM: Final = random.Random()
+
+MATE: Final = 30_000
+MATE_THRESHOLD: Final = MATE - 1_000
+INFINITY: Final = 1 << 20
+
+# MVV-LVA: order captures by the value of the victim, tie-broken by the cheapness of
+# the attacker. Measured at 8-29x fewer nodes depending on depth -- close to two free
+# plies, and the single highest-value item in the whole engine per line of code.
+_MVV: Final = (100, 320, 330, 500, 900, 20000)
+CAPTURE_BONUS: Final = 1 << 20
+# Below every capture, above every history-scored quiet move.
+KILLER_FIRST: Final = (1 << 20) - 1
+KILLER_SECOND: Final = (1 << 20) - 2
+PROMOTION_BONUS: Final = 1 << 19
+
+# Delta pruning margins. The per-capture margin is a minor piece: enough slack to
+# cover a positional swing, not so much that the test never fires. It was a queen's
+# worth (975) and was measured firing on 2 of 15,540 capture candidates -- inert.
+# At 200 the same trace prunes 11.7%.
+DELTA_MARGIN: Final = 200
+# The node-level test: if even winning a queen outright cannot reach alpha, the
+# whole capture search is hopeless and the standing evaluation stands.
+BIG_DELTA: Final = 975
+
+
+def _key(board: chess.Board) -> Hashable:
+    """The position's transposition key.
+
+    `_transposition_key` is private, but it costs 0.46 us where
+    `chess.polyglot.zobrist_hash` costs 12 us and `board.fen()` 23 us. At tens of
+    thousands of nodes per second nothing else is affordable.
+
+    It returns a tuple of bitboards plus turn, castling rights and the en passant
+    square, not an int -- a fine dict key, but never treat it as a number.
+    """
+    return board._transposition_key()
+
+
+
+def _feature(square: int, piece_type: int, colour: chess.Color, white_pov: bool) -> int:
+    """Feature index, matching training/features.py exactly.
+
+    A disagreement here is silent: the net loads, the engine runs, and it plays
+    badly. training/check_nnue.py asserts the two agree.
+    """
+    rel = square if white_pov else square ^ 56
+    own = (colour == chess.WHITE) if white_pov else (colour == chess.BLACK)
+    return (0 if own else 384) + (piece_type - 1) * 64 + rel
+
+
+
+# --------------------------------------------------------------------------------
+# Compiled evaluation kernels
+# --------------------------------------------------------------------------------
+# The evaluation is the hot path, not move generation: measured per node, the
+# network forward pass is 29.4% of search time and the accumulator another 15.4%,
+# against 13.4% for generating moves. numba is preinstalled on the platform and the
+# organisers name it as the supported way to make Python fast here.
+#
+# Eager signatures, so compilation happens at import inside the init budget (~90 s: see
+# INIT_READY_S below -- platform imports of 74.1 s and 88.1 s both played, >90 s forfeited)
+# rather than on the clock at move one. fastmath IS enabled, and this comment used
+# to claim the opposite. The concern behind the original wording was real --
+# fastmath lets the compiler reassociate floating-point arithmetic, so the
+# evaluation is not bit-identical across hardware. It was enabled anyway because
+# the alternative was measured and it cost too much: without it a float reduction
+# cannot vectorise at all, and the engine ran at 75 knps against 103. The accuracy
+# it buys back is one mismatch of 1cp in 7,808 positions, in either direction. That
+# is a good trade for a 37% node rate, but it is a trade, not a free lunch.
+#
+# If numba is unavailable or fails to compile, the pure-numpy path below is used
+# instead. An unguarded import here would raise at module load, which the platform
+# records as an init failure -- and that loses every game, not one.
+_COMPILED = False
+try:
+    from numba import float32, int32, int64, njit
+    from numba import types as _nbt
+
+    _W2T = np.ascontiguousarray(W2.transpose(0, 2, 1))  # (B, 32, 2A)
+
+    @njit(
+        float32(float32[:], float32[:], float32[:, ::1], float32[:], float32[:, ::1], float32[:]),
+        cache=False,
+        fastmath=True,
+    )
+    def _eval_kernel(
+        own: npt.NDArray[np.float32],
+        opponent: npt.NDArray[np.float32],
+        w2t: npt.NDArray[np.float32],
+        b2: npt.NDArray[np.float32],
+        w3: npt.NDArray[np.float32],
+        b3: npt.NDArray[np.float32],
+    ) -> np.float32:
+        hidden = np.empty(2 * ACC_SIZE, dtype=np.float32)
+        for i in range(ACC_SIZE):
+            x = own[i]
+            x = 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
+            hidden[i] = x * x
+            y = opponent[i]
+            y = 0.0 if y < 0.0 else (1.0 if y > 1.0 else y)
+            hidden[ACC_SIZE + i] = y * y
+        out = b3[0]
+        for j in range(32):
+            total = b2[j]
+            row = w2t[j]
+            for i in range(2 * ACC_SIZE):
+                total += hidden[i] * row[i]
+            if total > 0.0:
+                out += total * w3[j, 0]
+        # numba infers this as float32; the annotation says so but mypy cannot see
+        # through the decorator, so the accumulation reads as Any to it.
+        result: np.float32 = out
+        return result
+
+    @njit(
+        float32(
+            float32[:], float32[:], int64,
+            float32[:, :, ::1], float32[:, ::1], float32[:, :, ::1], float32[:, ::1],
+            float32[:],
+        ),
+        cache=False,
+        fastmath=True,
+    )
+    def _eval_bucket_kernel(
+        own: npt.NDArray[np.float32],
+        opponent: npt.NDArray[np.float32],
+        k: int,
+        w2t: npt.NDArray[np.float32],
+        b2: npt.NDArray[np.float32],
+        w3: npt.NDArray[np.float32],
+        b3: npt.NDArray[np.float32],
+        scratch: npt.NDArray[np.float32],
+    ) -> np.float32:
+        """_eval_kernel with the head chosen inside: slicing the four head arrays
+        in Python cost more than the arithmetic once there were eight of them.
+        `scratch` is a caller-owned 2*ACC_SIZE buffer: no allocation per call. The
+        head loop runs four output neurons at a time so `hidden` is read from
+        cache 8 times instead of 32; fastsearch.evaluate is this loop verbatim."""
+        hidden = scratch
+        acc = ACC_SIZE
+        for i in range(acc):
+            x = own[i]
+            x = 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
+            hidden[i] = x * x
+            y = opponent[i]
+            y = 0.0 if y < 0.0 else (1.0 if y > 1.0 else y)
+            hidden[acc + i] = y * y
+        out = b3[k, 0]
+        for j in range(0, 32, 4):
+            t0 = b2[k, j]
+            t1 = b2[k, j + 1]
+            t2 = b2[k, j + 2]
+            t3 = b2[k, j + 3]
+            r0 = w2t[k, j]
+            r1 = w2t[k, j + 1]
+            r2 = w2t[k, j + 2]
+            r3 = w2t[k, j + 3]
+            for i in range(2 * acc):
+                h = hidden[i]
+                t0 += h * r0[i]
+                t1 += h * r1[i]
+                t2 += h * r2[i]
+                t3 += h * r3[i]
+            if t0 > 0.0:
+                out += t0 * w3[k, j, 0]
+            if t1 > 0.0:
+                out += t1 * w3[k, j + 1, 0]
+            if t2 > 0.0:
+                out += t2 * w3[k, j + 2, 0]
+            if t3 > 0.0:
+                out += t3 * w3[k, j + 3, 0]
+        result: np.float32 = out
+        return result
+
+    @njit(
+        _nbt.void(
+            float32[:], float32[:], float32[:, :, ::1], int64,
+            float32[:, ::1], int32[:], int64, int32[:], int64, int64, int64,
+        ),
+        cache=False,
+        fastmath=True,
+    )
+    def _push_kernel(
+        white: npt.NDArray[np.float32],
+        black: npt.NDArray[np.float32],
+        stack: npt.NDArray[np.float32],
+        depth: int,
+        w1: npt.NDArray[np.float32],
+        added: npt.NDArray[np.int32],
+        n_added: int,
+        removed: npt.NDArray[np.int32],
+        n_removed: int,
+        white_offset: int,
+        black_offset: int,
+    ) -> None:
+        # The offsets select each perspective's king-zone block of W1; even index
+        # slots are the white perspective, odd slots the black one.
+        for i in range(ACC_SIZE):
+            stack[depth, 0, i] = white[i]
+            stack[depth, 1, i] = black[i]
+        for k in range(n_added):
+            rw = w1[added[2 * k] + white_offset]
+            rb = w1[added[2 * k + 1] + black_offset]
+            for i in range(ACC_SIZE):
+                white[i] += rw[i]
+                black[i] += rb[i]
+        for k in range(n_removed):
+            rw = w1[removed[2 * k] + white_offset]
+            rb = w1[removed[2 * k + 1] + black_offset]
+            for i in range(ACC_SIZE):
+                white[i] -= rw[i]
+                black[i] -= rb[i]
+
+    @njit(
+        _nbt.void(float32[:], float32[:], float32[:, ::1], int32[:], int64),
+        cache=False,
+        fastmath=True,
+    )
+    def _refresh_kernel(
+        out: npt.NDArray[np.float32],
+        b1: npt.NDArray[np.float32],
+        w1: npt.NDArray[np.float32],
+        indices: npt.NDArray[np.int32],
+        count: int,
+    ) -> None:
+        for i in range(ACC_SIZE):
+            out[i] = b1[i]
+        for k in range(count):
+            row = w1[indices[k]]
+            for i in range(ACC_SIZE):
+                out[i] += row[i]
+
+    @njit(_nbt.void(float32[:], float32[:], float32[:, :, ::1], int64), cache=False, fastmath=True)
+    def _pop_kernel(
+        white: npt.NDArray[np.float32],
+        black: npt.NDArray[np.float32],
+        stack: npt.NDArray[np.float32],
+        depth: int,
+    ) -> None:
+        for i in range(ACC_SIZE):
+            white[i] = stack[depth, 0, i]
+            black[i] = stack[depth, 1, i]
+
+    # Warm every kernel now, so no compilation lands on the game clock.
+    _warm_a = B1.copy()
+    _warm_b = B1.copy()
+    _warm_stack = np.zeros((2, 2, ACC_SIZE), dtype=np.float32)
+    _warm_idx = np.zeros(8, dtype=np.int32)
+    _eval_kernel(_warm_a, _warm_b, _W2T[0], B2[0], W3[0], B3[0])
+    _SCRATCH = np.zeros(2 * ACC_SIZE, dtype=np.float32)
+    _eval_bucket_kernel(_warm_a, _warm_b, 0, _W2T, B2, W3, B3, _SCRATCH)
+    _push_kernel(_warm_a, _warm_b, _warm_stack, 0, W1, _warm_idx, 1, _warm_idx, 1, 0, 0)
+    _warm_feats = np.zeros(32, dtype=np.int32)
+    _refresh_kernel(_warm_a, B1, W1, _warm_feats, 1)
+    _pop_kernel(_warm_a, _warm_b, _warm_stack, 0)
+    _COMPILED = True
+except Exception:
+    _COMPILED = False
+
+
+class Accumulator:
+    """Both perspectives' first-layer sums, maintained incrementally.
+
+    A full refresh costs ~5-10 us; an incremental update is ~0.6 us, and the search
+    does one per node. `push` stores the previous vectors so `pop` is a restore
+    rather than a recompute.
+    """
+
+    __slots__ = (
+        "added",
+        "black",
+        "depth",
+        "fast",
+        "features",
+        "flip_black",
+        "flip_white",
+        "removed",
+        "stack",
+        "white",
+        "zone_black",
+        "zone_white",
+        "zones",
+    )
+
+    def __init__(self) -> None:
+        self.white = B1.copy()
+        self.black = B1.copy()
+        # Each perspective's current king zone, and a stack of them so pop restores
+        # the zone along with the vectors. A king move that crosses a zone boundary
+        # rebuilds that one perspective from scratch; every other move is a delta.
+        self.zone_white = 0
+        self.flip_white = 0
+        self.flip_black = 0
+        self.zone_black = 0
+        # (zone_white, zone_black, flip_white, flip_black) -- the flips unwind with the
+        # zones, or a pop restores the wrong reflection for the rest of the search.
+        self.zones: list[tuple[int, int, int, int]] = []
+        # Scratch for a full rebuild: at most 32 first-layer indices.
+        self.features = np.zeros(64, dtype=np.int32)
+        self.fast = _COMPILED
+        if self.fast:
+            # One preallocated buffer instead of a fresh pair of arrays per node.
+            # ndarray here, list below: fixed at construction, never mixed.
+            self.stack: Any = np.zeros((MAX_PLY + 16, 2, ACC_SIZE), dtype=np.float32)
+            self.depth = 0
+            self.added = np.zeros(8, dtype=np.int32)
+            self.removed = np.zeros(8, dtype=np.int32)
+        else:
+            self.stack = []
+            self.depth = 0
+            self.added = np.zeros(8, dtype=np.int32)
+            self.removed = np.zeros(8, dtype=np.int32)
+
+    @staticmethod
+    def _king_zone(board: chess.Board, colour: chess.Color) -> int:
+        """The zone of `colour`'s king from its own side; 0 for a one-zone net."""
+        if KING_ZONES == 1:
+            return 0
+        king = board.king(colour)
+        if king is None:
+            return 0
+        own = king if colour == chess.WHITE else king ^ 56
+        return _zone(own ^ _mirror_flip(own) if MIRRORED else own)
+
+    @staticmethod
+    def _king_flip(board: chess.Board, colour: chess.Color) -> int:
+        """This perspective's file reflection, 0 or 7; always 0 when unmirrored."""
+        if not MIRRORED:
+            return 0
+        king = board.king(colour)
+        if king is None:
+            return 0
+        return _mirror_flip(king if colour == chess.WHITE else king ^ 56)
+
+    def _rebuild(
+        self, board: chess.Board, white_pov: bool, zone: int, out: npt.NDArray[np.float32]
+    ) -> None:
+        """One perspective's first-layer sum from scratch, in the given king zone,
+        written into `out`. Compiled, because a king crossing a zone boundary lands
+        here at ~3% of nodes, and the numpy row-add version cost 40 us each time."""
+        offset = zone * FEATURES
+        features = self.features
+        count = 0
+        for piece_type in range(1, 7):
+            for colour in (chess.WHITE, chess.BLACK):
+                mask = board.pieces_mask(piece_type, colour)
+                while mask:
+                    square = (mask & -mask).bit_length() - 1
+                    features[count] = offset + _feature(square, piece_type, colour, white_pov)
+                    count += 1
+                    mask &= mask - 1
+        if self.fast:
+            _refresh_kernel(out, B1, W1, features, count)
+            return
+        out[:] = B1
+        for k in range(count):
+            out += W1[features[k]]
+
+    def refresh(self, board: chess.Board) -> None:
+        self.zone_white = self._king_zone(board, chess.WHITE)
+        self.zone_black = self._king_zone(board, chess.BLACK)
+        self.flip_white = self._king_flip(board, chess.WHITE)
+        self.flip_black = self._king_flip(board, chess.BLACK)
+        self._rebuild(board, True, _block(self.zone_white, self.flip_white), self.white)
+        self._rebuild(board, False, _block(self.zone_black, self.flip_black), self.black)
+        self.zones.clear()
+        if self.fast:
+            self.depth = 0
+        else:
+            self.stack.clear()
+
+    def push(self, board: chess.Board, move: chess.Move) -> None:
+        """Apply a move's feature deltas. Must be called *before* board.push.
+
+        The deltas are collected into two small index arrays first, so the compiled
+        kernel can apply them in one call. At most two features are added (the moved
+        piece, and a rook when castling) and three removed (the from-square, a
+        capture, and the castling rook), each occupying two slots -- one per
+        perspective.
+        """
+        added = self.added
+        removed = self.removed
+        n_added = 0
+        n_removed = 0
+
+        mover = board.turn
+        piece_type = board.piece_type_at(move.from_square)
+        # A king move may carry its own perspective into another zone, in which case
+        # that perspective is rebuilt after the deltas below rather than updated.
+        crossing = 0  # 1 = white perspective, 2 = black perspective
+        new_zone = 0
+        new_flip = 0
+        if piece_type == chess.KING and KING_ZONES > 1:
+            own_to = move.to_square if mover == chess.WHITE else move.to_square ^ 56
+            new_flip = _mirror_flip(own_to) if MIRRORED else 0
+            new_zone = _zone(own_to ^ new_flip if MIRRORED else own_to)
+            old_flip = self.flip_white if mover == chess.WHITE else self.flip_black
+            old_zone = self.zone_white if mover == chess.WHITE else self.zone_black
+            if new_zone != old_zone or new_flip != old_flip:
+                crossing = 1 if mover == chess.WHITE else 2
+        self.zones.append(
+            (self.zone_white, self.zone_black, self.flip_white, self.flip_black)
+        )
+        if piece_type is not None:
+            removed[0] = _feature(move.from_square, piece_type, mover, True)
+            removed[1] = _feature(move.from_square, piece_type, mover, False)
+            n_removed = 1
+
+            captured = board.piece_type_at(move.to_square)
+            if captured is not None:
+                removed[2] = _feature(move.to_square, captured, not mover, True)
+                removed[3] = _feature(move.to_square, captured, not mover, False)
+                n_removed = 2
+            elif piece_type == chess.PAWN and move.to_square == board.ep_square:
+                # En passant: the captured pawn is not on the destination square.
+                behind = move.to_square + (-8 if mover == chess.WHITE else 8)
+                removed[2] = _feature(behind, chess.PAWN, not mover, True)
+                removed[3] = _feature(behind, chess.PAWN, not mover, False)
+                n_removed = 2
+
+            landing = move.promotion or piece_type
+            added[0] = _feature(move.to_square, landing, mover, True)
+            added[1] = _feature(move.to_square, landing, mover, False)
+            n_added = 1
+
+            if piece_type == chess.KING and abs(move.to_square - move.from_square) == 2:
+                rank = 0 if mover == chess.WHITE else 56
+                if move.to_square > move.from_square:
+                    rook_from, rook_to = 7 + rank, 5 + rank
+                else:
+                    rook_from, rook_to = 0 + rank, 3 + rank
+                removed[2 * n_removed] = _feature(rook_from, chess.ROOK, mover, True)
+                removed[2 * n_removed + 1] = _feature(rook_from, chess.ROOK, mover, False)
+                n_removed += 1
+                added[2 * n_added] = _feature(rook_to, chess.ROOK, mover, True)
+                added[2 * n_added + 1] = _feature(rook_to, chess.ROOK, mover, False)
+                n_added += 1
+
+        self._apply(added, n_added, removed, n_removed)
+
+        if crossing:
+            # The deltas above were applied in the old zone, which is now the wrong
+            # block for the perspective that crossed; recompute it in the new one.
+            # The vectors saved on the stack are the pre-move ones, so pop is exact.
+            board.push(move)
+            try:
+                if crossing == 1:
+                    self.zone_white = new_zone
+                    self.flip_white = new_flip
+                    self._rebuild(board, True, _block(new_zone, new_flip), self.white)
+                else:
+                    self.zone_black = new_zone
+                    self.flip_black = new_flip
+                    self._rebuild(board, False, _block(new_zone, new_flip), self.black)
+            finally:
+                board.pop()
+
+    def _apply(
+        self,
+        added: npt.NDArray[np.int32],
+        n_added: int,
+        removed: npt.NDArray[np.int32],
+        n_removed: int,
+    ) -> None:
+        """Save the current vectors, then add and subtract the given W1 rows, each
+        perspective in its own king-zone block."""
+        # The reflection rides in the offset: a perspective whose king is on files e-h reads
+        # the second half of W1, which holds the file-flipped rows. Nothing downstream --
+        # including the compiled push kernel -- needs to know mirroring exists.
+        white_offset = _block(self.zone_white, self.flip_white) * FEATURES
+        black_offset = _block(self.zone_black, self.flip_black) * FEATURES
+        if self.fast:
+            # The compiled kernel does no bounds checking -- numba's eager
+            # signatures compile with boundscheck off, so overrunning the stack
+            # corrupts memory and crashes rather than raising. Search depth is
+            # bounded well below this, but a crash loses the game outright, so the
+            # buffer grows instead of trusting that.
+            if self.depth >= len(self.stack):
+                grown = np.zeros((len(self.stack) * 2, 2, ACC_SIZE), dtype=np.float32)
+                grown[: len(self.stack)] = self.stack
+                self.stack = grown
+            _push_kernel(
+                self.white, self.black, self.stack, self.depth,
+                W1, added, n_added, removed, n_removed, white_offset, black_offset,
+            )
+            self.depth += 1
+            return
+
+        self.stack.append((self.white.copy(), self.black.copy()))
+        for k in range(n_added):
+            self.white += W1[added[2 * k] + white_offset]
+            self.black += W1[added[2 * k + 1] + black_offset]
+        for k in range(n_removed):
+            self.white -= W1[removed[2 * k] + white_offset]
+            self.black -= W1[removed[2 * k + 1] + black_offset]
+
+    def pop(self) -> None:
+        (
+            self.zone_white,
+            self.zone_black,
+            self.flip_white,
+            self.flip_black,
+        ) = self.zones.pop()
+        if self.fast:
+            self.depth -= 1
+            _pop_kernel(self.white, self.black, self.stack, self.depth)
+            return
+        self.white, self.black = self.stack.pop()
+
+    def evaluate(self, turn: chess.Color, pieces: int = 32) -> int:
+        """Centipawns from the side to move's point of view.
+
+        `pieces` is the number of men on the board and selects the output head.
+        """
+        if turn == chess.WHITE:
+            own, opponent = self.white, self.black
+        else:
+            own, opponent = self.black, self.white
+        k = _bucket(pieces)
+        scale = float(PIECE_SCALE[pieces if 0 <= pieces <= 32 else 32])
+        if self.fast:
+            compiled: float = float(
+                _eval_bucket_kernel(own, opponent, k, _W2T, B2, W3, B3, _SCRATCH)
+            )
+            return int(compiled * scale)
+        hidden = np.concatenate((own, opponent))
+        np.clip(hidden, 0.0, 1.0, out=hidden)
+        hidden *= hidden  # SCReLU
+        second = np.maximum(hidden @ W2[k] + B2[k], 0.0)
+        return int(float((second @ W3[k] + B3[k])[0]) * scale)
+
+
+def _to_table(score: int, ply: int) -> int:
+    """Make a mate score independent of where in the tree it was found.
+
+    Search returns mate scores relative to the root: being mated at `ply` scores
+    `-MATE + ply`, so a later mate is a better one. The transposition table
+    outlives the search -- it persists across our moves within a game -- so a
+    score stored at one ply is read back at another, and the root has shifted by
+    two plies by the next move. Storing verbatim corrupts mate *distance*, which
+    is exactly the signal needed to shorten a mate rather than shuffle.
+    """
+    if score > DISTANCE_THRESHOLD:
+        return score + ply
+    if score < -DISTANCE_THRESHOLD:
+        return score - ply
+    return score
+
+
+def _from_table(score: int, ply: int) -> int:
+    """Undo `_to_table`, putting a stored mate score back on this node's clock."""
+    if score > DISTANCE_THRESHOLD:
+        return score - ply
+    if score < -DISTANCE_THRESHOLD:
+        return score + ply
+    return score
+
+
+class Timeout(Exception):
+    """Raised to unwind the search when the hard time limit passes."""
+
+
+# The table persists for the whole game, and a full 120 s + 0.5 s game is about
+# 160 s of thinking. Measured here: 3,919 new entries per second at 752 bytes each,
+# so an unbounded table reaches ~627,000 entries and 0.47 GB -- a quarter of the
+# 2 GB cap, before python-chess, numpy and the tablebase. Every SPRT so far ran at
+# 8 s controls, where it only reaches ~39,000 entries, so this has never been
+# exercised at the control the agent will actually play. Cheap insurance.
+MAX_TABLE: Final = 400_000
+
+# Reverse futility pruning. If the static evaluation is far enough above beta that
+# even a sizeable positional swing could not bring it below, the node is assumed to
+# fail high and is cut without searching. Measured at +145.83 +/- 24.41 in one
+# engine's SPRT series and +57.1 +/- 16.9 in another's, and it fires at shallow
+# depth -- which is all this engine has.
+#
+# It is also the first consumer of evaluation quality outside quiescence leaves.
+# Until now a better network had almost nowhere to deposit its improvement, which
+# is a candidate explanation for the 4x wider net measuring +13 +/- 21.
+RFP_MAX_DEPTH: Final = 6
+RFP_MARGIN: Final = 80
+
+# Null-move pruning: give the opponent a free move; if the position still fails
+# high, the real move would too. Measured +51.4 +/- 14.6 and +116.0 +/- 25.2 in two
+# independent engines. Requires non-pawn material, because in a pawn endgame
+# zugzwang makes the null-move assumption false.
+NMP_MIN_DEPTH: Final = 3
+NMP_REDUCTION: Final = 2
+MAX_PLY: Final = 72
+
+# --------------------------------------------------------------------------------
+# Experiment switches
+# --------------------------------------------------------------------------------
+# One change each, off by default, so the champion plays exactly as the promoted
+# build did. overnight/night.sh builds a challenger by turning a single switch on,
+# runs the gauntlet, and on a PASS the switch stays on in the champion. Once every
+# switch has a verdict the losing branches are deleted.
+#
+# TIME_V2        stop deepening when the next iteration is predicted to overrun the
+#                soft budget, cap one move at 12% of the clock instead of 35%, and
+#                hold back a reserve. The shipped budget measured 98% of a 120 s game
+#                spent and single moves at 4x their soft budget.
+# QS_EVASIONS    in quiescence, a side in check searches its evasions instead of
+#                standing pat on an evaluation that was never trained on checks.
+# STAGED_MOVEGEN try the hash move before generating any moves: legal generation is
+#                28 us, about half of a node, and a hash move cuts most nodes.
+# HYGIENE        halve the history table each move, record the position after our
+#                move for repetition detection, and never let reverse futility
+#                answer a mate-bound window.
+TIME_V2: Final = True
+QS_EVASIONS: Final = False
+STAGED_MOVEGEN: Final = False
+HYGIENE: Final = True
+# CONTEMPT: a repetition or fifty-move draw is not worth exactly zero. Measured at
+# the tournament control, 37% of games against Stockfish skill 10 ended by
+# repetition, and against Weiss depth 8 -- an opponent this engine beats 88% of the
+# time -- five games were repetition draws in the middlegame, two of them with the
+# engine two points of material ahead. In a 13-round Swiss most opponents are
+# weaker, so a half point conceded from an equal or better position is the most
+# expensive habit left. The referee also adjudicates on raw material at ply 300,
+# so being ahead late makes a draw cost a whole point.
+CONTEMPT: Final = True
+# FUTILITY: at depth 1-2, not in check, skip quiet moves when the static score plus
+# a margin cannot reach alpha. Reverse futility, the mirror image, measured +62.
+FUTILITY: Final = True
+# TT_AGE: replace transposition entries by age and depth instead of clearing the
+# whole table every 400k entries -- about once a minute at the compiled node rate.
+TT_AGE: Final = False
+# PVS: after the first move, search the rest with a null window and re-search
+# only when one surprises. Never tested here on its own, only bundled with LMR.
+PVS: Final = False
+# TIME_V3: two lessons from the platform's round-4 loss. The schedule was
+# front-loaded -- 52 s left at move 20, 17 s at move 40, the last thirty moves at
+# half a second each -- so the horizon is longer and more moves are expected. And
+# the decisive error was played in 1.6 s because the iteration-cost rule stopped
+# deepening at a position where one more ply found the right move; when the best
+# move changes or the score drops between iterations the position is unstable,
+# and the next iteration is allowed up to 2.5 soft budgets instead of 1.5.
+TIME_V3: Final = True
+# TIME_V4: an unfinished iteration is not worthless. A transposition table warm
+# from the previous move lets the early iterations finish in milliseconds, the
+# cost predictor launches the next depth blind, and it hits the hard cap -- but a
+# root move that completed at the new depth with a score above the previous best
+# has been proven better, and is kept. (A floor on the predicted cost was tried
+# alongside this and measured 46% at 120 s: it stops iterations a warm table
+# would have finished. Dropped.)
+TIME_V4: Final = True
+# TIME_V5: the 26-move floor on the horizon still banks time at move 70 that the
+# game will never use; lower it to 18 so the mid and late game spend more. Paired
+# with a refund so calm positions hand the extra back: after two consecutive
+# completed iterations that kept the same best move with no score drop, the next
+# iteration is allowed 1.0 soft budgets instead of 1.5. Only the 120 s control
+# can see it -- below LOW_CLOCK the budget is remaining/30 and the floor never
+# binds, so 8 s games are unchanged; judged by clocktest + 40 games at 120 s.
+TIME_V5: Final = True
+# CORRECTION: correction history. The static evaluation is wrong in ways that
+# repeat. In the platform's round-8 loss it said +400 to +1010 in a rook-and-knight
+# ending that the search itself scored between -37 and -164, and reverse futility
+# and futility both trust the static score, so a persistent error cuts exactly the
+# lines that would refute it. Per side to move and pawn structure this keeps the
+# running gap between the static score and what the search returned, and adds it
+# to the static score before anything trusts it.
+CORRECTION: Final = False
+# TT_EVAL: a transposition entry for this node holds a searched score. When its
+# bound allows -- exact, a lower bound above the static score, or an upper bound
+# below it -- that score replaces the static score for reverse futility and
+# futility, so a search result already in hand is trusted over the network's
+# guess. The guard for the round-8 pattern that needs no learning.
+TT_EVAL: Final = False
+# COMPILED_SEARCH: negamax and quiescence run as numba kernels (fastsearch.py)
+# over the compiled board, with the transposition table as fixed arrays. Same
+# semantics as FastEngine.search -- testing/check_fastsearch holds them to
+# identical scores and node counts at fixed depth with the table off. The root
+# loop, the time rules and the fallback are unchanged.
+COMPILED_SEARCH: Final = True
+# LMR / LMP: late move reductions and late move pruning inside the compiled
+# search (fastsearch.py). LMR reduces the depth of quiet moves after the first
+# two by a log-log amount and re-searches on a fail high; LMP skips the quiet
+# tail of the move list at depth <= 3. Both need COMPILED_SEARCH. PVS in the
+# kernel follows the PVS switch above.
+LMR: Final = True
+LMP: Final = False
+# SEE: in quiescence, skip captures that lose material on the exchange
+# (fastboard.see). Needs COMPILED_SEARCH.
+SEE: Final = True
+# ASPIRATION: from depth 4 the root searches a window of +/- ASPIRATION_WINDOW
+# around the previous iteration's score, widening on a fail and falling back to
+# the full window after three fails. Narrow windows cut off sooner.
+ASPIRATION: Final = True
+ASPIRATION_WINDOW: Final = 15
+# REPETITION_TWOFOLD: the referee calls board.outcome(claim_draw=True) after every
+# move, and python-chess lets the side to move claim as soon as ONE legal move
+# would make a third occurrence. Round 11 on the platform was drawn with a mate
+# on the board for us, because two positions had occurred twice and the referee
+# stopped the game before we chose. So in the search a position that has
+# occurred even once before in the game is a draw: while winning the engine
+# never lets a position repeat at all.
+REPETITION_TWOFOLD: Final = True
+# PONDER: the rules allow thinking on the opponent's time ("your process keeps
+# its core while the opponent thinks") and the runner keeps this process alive
+# between requests. After answering, a second engine that shares the main
+# engine's transposition table searches the position it expects next -- our
+# move plus the reply the table predicts -- until the next request arrives,
+# which stops it within a millisecond. The main search then starts on a warm
+# table. Needs COMPILED_SEARCH; the kernels release the GIL.
+PONDER: Final = False
+# NMP_GUARD: no null move directly after a null move. Found by review on 4 Sep:
+# two nulls restore the Zobrist key, the stack repetition check fires and the
+# grandchild scores as a draw, so null-move pruning never cut at depth >= 6.
+NMP_GUARD: Final = False
+# RFP_PHASE: the static score is 2-6x less accurate below 17 pieces (mean |err|
+# 50 cp at 29-32 pieces, 194 at 13-16, 290 at 9-12), yet reverse futility and
+# futility prune on it with one margin. Scale both margins by piece count:
+# 1.6x at 17-20, 2x at 13-16, 3x at 9-12, off at 8 and below.
+RFP_PHASE: Final = False
+# percent of the normal margin in the bands <= 8, 9-12, 13-16, 17-20 pieces (0 = off)
+RFP_PHASE_PERCENT: Final = (0, 300, 200, 160)
+# IIR: internal iterative reduction, one ply less at depth >= 4 without a hash move.
+IIR: Final = False
+# BOOK_ENABLED: the polyglot book. Games start from curated positions at ply
+# 10-16, so the book fires 0-3 plies per game, covers 35% of the curated pool,
+# and on the platform games it cost ~20 cp per firing, with one line losing to
+# a Greek gift. Off means the search plays from move one.
+BOOK_ENABLED: Final = True
+# HISTORY2: move ordering. History indexed by side to move with a gravity update
+# (bounded at +/-16384, so it can never outrank a capture or a killer) and a
+# malus for the quiet moves searched before a cutoff; a counter-move table keyed
+# on the opponent's last move, ranked just below the killers. Needs COMPILED_SEARCH.
+HISTORY2: Final = True
+# TT_KEEP: table entries from the previous search are not evicted freely; a new
+# entry replaces an aged one only if it is at most 4 plies shallower. The warm
+# table is what makes the early iterations of the next move free.
+TT_KEEP: Final = False
+# TT_BUCKETS: the transposition table as pairs of slots. The even slot keeps the
+# deeper entry, the odd slot always takes the store, and a probe checks both, so
+# a deep entry survives the key traffic that evicts it from a single slot.
+TT_BUCKETS: Final = True
+# QS_CAP: quiescence depth cap. 8 truncates long exchanges; with SEE pruning the
+# capture tree is small enough to follow to 14.
+QS_CAP: Final = 14
+# SAFE_BITS: mate-distance pruning, null-move reduction growing with depth, and
+# a forced move played without searching.
+SAFE_BITS: Final = True
+# BOOK_VERIFY: a book move is searched first and played only if the search's own
+# best is not better by more than BOOK_VERIFY_MARGIN centipawns. Closes the book
+# lines measured at -68 and -165 cp on the platform's own start positions.
+BOOK_VERIFY: Final = False
+# QS_EVAL_CACHE: memoise quiescence static evaluations by position key (exact).
+QS_EVAL_CACHE: Final = True
+# SEE_MAIN: in the main search skip captures losing more than 20*depth^2 on the
+# exchange at depth <= 5 (never the first move).
+SEE_MAIN: Final = True
+# ROOT_ORDER: from the second iteration order the root moves by the scores the
+# previous iteration gave them (stable: moves the aspiration pass never reached
+# keep their old order at the tail) instead of re-running the static ordering.
+# The book/hash move still leads. Fail-low values are only upper bounds, but
+# the relative order they induce is what most engines sort the root by.
+ROOT_ORDER: Final = True
+# LMR_AGGRESSIVE: depth is the main lever. Reduce quiet moves from the second
+# one searched with the steeper log(d)*log(m)/1.8 + 0.5 table, adjusted by
+# butterfly history (one ply less above +8000, one more below -8000, never
+# below depth 1), and turn PVS on inside the same switch: the null-window
+# re-searches are what make the deeper reductions cheap. PVS failed alone
+# twice; paired with reductions is the standard reason it exists. Needs
+# COMPILED_SEARCH.
+LMR_AGGRESSIVE: Final = True
+# CHECK_EXT_CAP: at most this many check extensions on one line (0 = unlimited).
+CHECK_EXT_CAP: Final = 0
+# LAZY_ACC: defer the NNUE accumulator update from make to the first evaluate
+# on the line. Exact -- same nodes, same scores -- but a node cut off by the
+# hash table, a repetition, or the null move before any static evaluation never
+# pays the two 512-float row updates or the astack save/restore, which profiled
+# at 15.4% of search time. Needs COMPILED_SEARCH.
+LAZY_ACC: Final = True
+# PRUNE_V2: prune plain quiet moves harder at depth <= 4, after the first move
+# at a node, when not in check and not near a mate: futility with a margin of
+# 100 cp per ply of depth, and a history cut for quiets whose butterfly score
+# is below -1500 per ply of depth. Removes whole subtrees rather than
+# shortening them, which is what a depth gain needs. Needs COMPILED_SEARCH and
+# HISTORY2 (the history cut reads the side-to-move band).
+PRUNE_V2: Final = True
+# SINGULAR: singular extensions. At depth >= 7 with a hash move whose stored
+# bound is exact or a lower bound at depth >= depth - 3, the node is searched
+# again without that move at half depth with a window two CENTIpawns per ply below
+# the stored score; if nothing else reaches it the hash move is the only move
+# and is searched a ply deeper. Capped at six check-or-singular extensions on
+# a line. Needs COMPILED_SEARCH.
+SINGULAR: Final = True
+BOOK_VERIFY_MARGIN: Final = 25
+PONDER_MAX_S: Final = 600.0
+# PONDER_DIAG: print, at each request, the wall time since the ponder thread started
+# and how many nodes it searched. The platform shows stderr in the validation log's
+# smoke games, which is the only way to see whether pondering runs there.
+PONDER_DIAG: Final = False
+# PONDER_PROBE: answer "does the platform run us between moves?" through the only
+# channel a rated game gives back, the clock. On our moves 8-10 the search gets a
+# fixed 1.0 s when the ponder thread searched >= 100k nodes in the gap before the
+# request, and a fixed 3.0 s when it did not. Read the PGN clocks of one game.
+PONDER_PROBE: Final = False
+
+# CONTEMPT: draw scores from the root side's point of view, in centipawns. Level
+# positions carry a small reluctance to repeat; being ahead carries more, rising
+# toward the adjudication ply; being behind makes a draw welcome.
+FUTILITY_MARGIN: Final = (0, 150, 300)
+# CORRECTION: table of 2 x 2**BITS entries in grain units; a node of depth d moves
+# its entry toward the observed gap with weight min(d + 1, WEIGHT_MAX) / SCALE.
+# A first version with cap 400 and scale 256, also applied to the quiescence
+# stand-pat, measured -137 +/- 65 (048): the entries saturated within seconds and
+# one tactical gap was charged to every leaf sharing its pawn structure. This is
+# the mild bias the technique is meant to be.
+CORRECTION_BITS: Final = 14
+CORRECTION_GRAIN: Final = 256
+CORRECTION_SCALE: Final = 1024
+CORRECTION_WEIGHT_MAX: Final = 16
+CORRECTION_CAP: Final = 100
+CORRECTION_QS: Final = False
+CONTEMPT_LEVEL: Final = 10
+CONTEMPT_AHEAD: Final = 25
+CONTEMPT_AHEAD_LATE: Final = 50
+CONTEMPT_BEHIND: Final = -20
+ADJUDICATION_PLY: Final = 300
+# ADJUDICATION (V10_PLAN #3): play the referee's ply-300 material adjudication,
+# not just chess. (a) The ply counter is pinned to MATCH plies at our first
+# request (the referee counts from the curated start FEN; fullmove_number counts
+# from the real initial position and ran 13 ahead in round 18). (b) Behind on
+# raw material the draw score ramps from +20 cp to a large bonus as the cap
+# nears -- at ply 280 a repetition is worth a half point, not 20 cp (round 18
+# shuffled an eval-0 K+R+N vs K+Q into a material adjudication loss). (c) When
+# behind AND a fifty-move draw is reachable before the cap
+# (match_ply + 100 - halfmove_clock <= 300), the kernel's draw threshold
+# C_HMC_DRAW drops to halfmove_clock + ADJ_HORIZON: a horizon's worth of
+# non-zeroing plies scores as the draw we are steering for. Also uses HISTORY2's
+# quiets fix and KILLER_CLEAR slots in the same ctrl block.
+ADJUDICATION: Final = True
+ADJ_BEHIND_LATE: Final = 300  # cp added to the behind-side draw score by the cap
+ADJ_WINDOW: Final = 80  # arm the fifty-move plan only this close to the cap
+ADJ_HORIZON: Final = 16  # non-zeroing plies the search credits as draw-reaching
+# ADJ_V2: the platform's cap is 600 plies AND IT IS A DRAW -- material is never
+# consulted (canonical rules, verified twice; harness/rules.py is a stale copy
+# with 300 + a material award, and testing/referee.py was corrected on 6 Sep to
+# play the real game). Three things follow, and all three are the opposite of
+# what ADJUDICATION assumes:
+#   (a) the cap is 600, not 300, so every ply-based ramp is re-based on it;
+#   (b) behind on material, reaching the cap is a DRAW, not a loss: we do not
+#       have to buy a draw before a deadline, we only have to not lose. So the
+#       behind-side bonus stops being "a draw is nearly a full half point"
+#       (ADJ_BEHIND_LATE 300 cp -- more than a rook) and becomes a bounded
+#       preference, ADJ_BEHIND_LATE_V2;
+#   (c) ahead, the cap TAKES a won game away, so ahead-side urgency belongs near
+#       600 -- it was reaching full strength ~300 plies early.
+# The practical size of this is not the cap change but the ramp: `late` is
+# (ply - cap/2) / (cap/2), so at ply 225 the champion is already at late 0.50 --
+# a +170 cp draw score when behind and 37 cp of contempt when ahead, in an
+# ordinary middlegame. Under ADJ_V2 late is 0 there and the base contempts
+# (+20 / -25) stand until ply 300. Longest game on record is 323 plies.
+ADJ_V2: Final = False
+PLATFORM_PLY_CAP: Final = 600  # canonical rules: still running at 600 -> draw
+ADJ_BEHIND_LATE_V2: Final = 100  # cp; a draw is worth a pawn, never a rook
+# HISTORY2_FIX (v10 search.md 3.7): zero quiets[ply, searched] for non-quiet
+# moves; without it the cutoff malus punishes stale moves recorded by an earlier
+# node at the same ply. KILLER_CLEAR (same source): clear killers[ply + 2] on
+# node entry and the whole table between root moves; killers from another
+# subtree or the previous search are noise in move ordering.
+HISTORY2_FIX: Final = True
+KILLER_CLEAR: Final = True
+# KILLER_SHIFT (V10_PLAN #12's last unbuilt filler, agent.py only -- no kernel
+# change, so it costs nothing at init). KILLER_CLEAR throws the whole killer
+# table away between root moves. But the tree does not move: it shifts down by
+# exactly two plies (our move, then theirs), so the previous search's killers at
+# ply p are this search's killers at ply p - 2, at the same distance from the
+# same leaves. Shifting instead of clearing keeps that and still drops the two
+# stale ply rows at the bottom. Needs KILLER_CLEAR (it replaces its between-move
+# half; the ply + 2 clear on node entry is the kernel's and is untouched).
+KILLER_SHIFT: Final = False
+# CONT_HIST (v10 search.md 3.1): 1-ply continuation history. A 768x768 int32
+# table indexed by (previous move's piece*64+to, this quiet's piece*64+to),
+# added to the quiet ordering score, the LMR history term (continuous
+# hist // 6000 clamped +/-2 instead of the +/-8000 step) and the prune2
+# history test; butterfly-style gravity update on a cutoff, halved under
+# HYGIENE, no read or update after a null move.
+CONT_HIST: Final = False
+# IMPROVING (v10 search.md 3.3): static_eval(ply) > static_eval(ply - 2), the
+# stack in exts[MAX_PLY + ply] (sentinel -INFINITY in check, ply < 2 defaults
+# to improving). When NOT improving prune harder: RFP margin depth - improving,
+# prune2 futility FUTILITY_MARGIN2[depth - improving], LMR reduction += 1.
+# Costs one static eval at the <1% of non-check nodes deeper than RFP reaches.
+IMPROVING: Final = False
+# CUTNODE (same source): expected-fail-high flag passed down the tree (the one
+# new kernel parameter): the null-move child is always a cut node, a null-window
+# child is a cut node iff its parent was not, a full-window child of a PV node
+# is a PV node. Use: LMR reduction += 1 at cut nodes.
+CUTNODE: Final = False
+# NMP_V2 (V10_PLAN #6): dynamic null-move reduction R = 3 + depth//4 +
+# min((standing - beta) // 200, 3) replacing the fixed depth - 3 - depth//6,
+# tried only when the static eval stands at or above beta, skipped when the TT
+# holds an upper bound below beta (expected fail-low; the null search is wasted
+# nodes). Verification search at depth >= 10 deferred to NMP_V2B.
+NMP_V2: Final = True
+# NMP_V2B (follow-up to NMP_V2, which PROMOTED as 143-nmp): on a null-move
+# cutoff at depth >= 10, verify with a reduced-depth real search at the same
+# node before trusting the cutoff; null pruning is disabled below
+# ply + 3*null_depth//4 inside the verification subtree (Stockfish's
+# nmpMinPly zugzwang guard). Cheap at 8 s (fires only at depth >= 10) and
+# protects exactly the deep nodes where a wrong null cutoff poisons the tree.
+NMP_V2B: Final = True
+# CAPTURE_ORDER (V10_PLAN #7): rescore non-promotion captures after score_moves.
+# SEE-losing captures drop below every quiet (band -(1 << 21) + see*16);
+# winning/equal captures keep the MVV-LVA band; both get a capture-history
+# tiebreak. The capture history reuses the first 4608 entries of the conthist1
+# buffer, indexed (attacker_piece*64 + to)*6 + victim%6 -- safe because
+# CONT_HIST is closed/rejected (both on together raises at init). Gravity
+# bonus on a capture cutoff, decayed >>= 1 per move under HYGIENE.
+CAPTURE_ORDER: Final = True
+# QS_TT (V10_PLAN #9): probe and store the main transposition table in
+# quiescence. A hit of any depth cuts (exact returns; lower >= beta, upper <=
+# alpha); stores are depth 0 / move 0 bounds at the stand-pat cutoff, the
+# capture-loop cutoff and the final return, and never evict a same-key or
+# current-age entry of depth > 0 (main-search entries keep their hash moves).
+QS_TT: Final = True
+# SEE_QUIET (the SEE-pruning follow-up to SEE_MAIN): skip a late quiet move at
+# depth <= 6 when static exchange on its destination square loses more than
+# 30 * depth^2 (the moved piece hangs). Guards: not in check, not the node's
+# first move, alpha away from mate. fb.see already handles quiet moves (victim
+# value 0, both sides free to stop), so no board change is needed.
+SEE_QUIET: Final = False
+# ENDGAME_SHRINK (V10_PLAN #11, overnight/eval/v10/endgame_shrink.md): below 17
+# pieces blend the static eval toward pure material (_MATERIAL values,
+# side-to-move POV) inside fastsearch.evaluate, so the QS eval cache and the
+# TT's stored static eval hold the blended value and nothing double-blends.
+# The net's weight ramps 256/256 at 17 pieces down to WMIN/256 at 6; the
+# correction is clamped to +/- CAP cp and mate-range scores are never touched.
+# A damper for the measured 400-700 cp endgame eval errors (games.md,
+# rounds25-29.md). Calibrated 6 Sep against endgame_suite.json's 400 labels
+# (testing.eg_calib, overnight/eval/v10/eg_calib.log): net static error 673.7
+# cp at 5-8 pieces, 228.4 at 9-12, 137.3 at 13-16; WMIN 128 / CAP 600 cuts
+# those to 532.1 / 176.8 / 132.5 -- every band better, gains monotone in
+# aggressiveness, so the most aggressive capped point wins (uncapped is better
+# still but moves single positions up to 2682 cp -- fortress risk). The cure
+# is NET_V10.
+ENDGAME_SHRINK: Final = False
+ENDGAME_SHRINK_WMIN: Final = 128
+ENDGAME_SHRINK_CAP: Final = 600
+# ASP_WIDE (V10_PLAN #12): aspiration re-search windows widen geometrically
+# (~1.5x per fail: window * 3**fails // 2**fails) instead of 4**fails with a
+# jump to +/-INFINITY on the third fail; full-width only after ten fails as a
+# termination backstop. Cheap re-searches near the score replace one expensive
+# full-width pass when the root swings.
+ASP_WIDE: Final = True
+# ROOT_NODES (V10_PLAN #12, root-move improvements): from the second iteration
+# order the root moves after the front move by how many nodes their subtree cost
+# on the previous iteration (most first), with the previous score as the
+# tiebreak, instead of by the previous score alone. Under a null window every
+# move except the best fails low, so its score is only a loose upper bound and
+# most of them come back equal; the node count is not degenerate -- a move that
+# consumed many nodes nearly raised alpha (it forced the full-window re-search),
+# one that failed low in a handful of nodes is refuted. Pure root ordering in
+# agent.py: no kernel change, so the kernel stays bit-identical.
+ROOT_NODES: Final = False
+# SINGULAR_EXT2 (overnight/eval/v10/search.md #10, the follow-up to SINGULAR):
+# grade the singular verification instead of reading it as yes/no. At a non-PV
+# node, if the hash move beats every alternative by more than 25 cp below the
+# singular beta it is extended TWO plies instead of one (the line is forced, so
+# depth spent there is depth spent on the only move that matters); if it is not
+# singular at all but the table already says the node fails high, it is searched
+# one ply SHALLOWER, because the cutoff is coming anyway. Fires only inside the
+# existing singular block -- same entry guards, and the double arm needs two
+# spare slots under SINGULAR_EXT_CAP, so no line extends further than today.
+SINGULAR_EXT2: Final = False
+# RAZOR (overnight/eval/v10/search.md #11): the fail-LOW twin of reverse
+# futility. At depth <= 3, at a non-PV node that is not in check, a static eval
+# more than RAZOR_MARGIN[depth] cp BELOW alpha means a quiet move is very
+# unlikely to rescue the node, so the subtree is replaced by a quiescence
+# search: if that also comes back at or below alpha the node returns it
+# immediately. Reuses the standing eval reverse futility has already computed,
+# so it costs no extra evaluate call. Verification (the qsearch) is what keeps
+# it safe -- a tactical shot still gets found.
+RAZOR: Final = False
+# INIT_FOLD (speed.md section 2): fastsearch scans this file at import and,
+# when this is True, compiles the settled switch slots (the eighteen in
+# _fs.FOLDED) as constants instead of ctrl reads -- numba prunes the dead arms
+# before typing, cutting fs.warm_up ~18% (~-4.3 s local, ~-8 s platform). Node
+# and score exact by construction; prepare() asserts ctrl matches _fs.FOLDED.
+# Off in the tree so testing/check_fastsearch can still zero ctrl and hold the
+# kernel to the flags-off reference.
+INIT_FOLD: Final = False
+# INIT_ASYNC (the #1 measured risk, 6 Sep): the platform starts a FRESH PROCESS for
+# every ladder game and gives `import agent` a fixed 90 s budget; a game whose import
+# overruns is lost outright ("game ended white by init"), before a move is played.
+# Four platform samples: 74.1 s, >90 s (LOST), 88.1 s, 64.1 s. 89% of that import is
+# numba compiling the search kernel (28.9 s of 32.4 s here, and their box is ~2.1x).
+# With this on, that one compile runs in a daemon thread and import waits for it only
+# until INIT_READY_S from the top of this file; past that, import returns, the runner
+# prints its ready line, and the first get_move joins the thread and charges the wait
+# to its own move budget. A slow first move is survivable -- the clock is 120 s + 0.5 s
+# per side -- where a failed init is a certain loss. When the compile fits inside the
+# deadline (every local run does) this is byte-for-byte the current behaviour.
+INIT_ASYNC: Final = True
+# Seconds from the top of this module at which import gives up waiting. 72 of the
+# platform's 90 leaves 18 s for python start-up, the runner and their scheduling
+# jitter; the samples above say the compile itself usually lands well inside it.
+INIT_READY_S: Final = 72.0
+# How many earlier occurrences of a position make it a draw inside the search.
+_REPEAT_LIMIT: Final = 1 if REPETITION_TWOFOLD else 2
+
+# TIME_V2: the clock is never allowed below this fraction of its starting value,
+# which is inferred as the largest time_left_ms seen in the game. 12 s at 120 s.
+RESERVE_FRACTION: Final = 0.10
+# TIME_V2: below this many seconds the budget stops crediting the increment.
+LOW_CLOCK: Final = 15.0
+# TIME_V6 (V10_PLAN #1): what every OpenBench engine measured. (a) The budget
+# credits the increment it actually observes (median of the clock deltas between
+# our calls), keeps a 6% reserve instead of 10%, and drops the low-clock regime
+# to 12 s -- the 13 s absorbing floor in games.md came from the 10% reserve plus
+# remaining/30 below 15 s. (b) The next iteration is never predicted (Ethereal
+# gained +6..+12 removing exactly that); the search stops at an iteration end
+# once elapsed exceeds ideal x stability x score-drop x node-effort, with the
+# hard deadline (2.5 soft budgets, 10% of the clock) as the only mid-iteration stop.
+# Stability 1.2 -> 0.8 (Ethereal), score-drop 2^(+drop/100) where drop = older - newer,
+# so a falling score LENGTHENS the search (Stash writes it as 2^(-diff/100) over the
+# opposite subtraction -- same rule, and the sign here matches this file's `drop`), node effort
+# max(0.5, 2.0 - 1.6*bestFraction) (Ethereal/Koivisto), product clamped [0.4, 1.5].
+# The first cut (Stash's 2.5x table, 4 soft budgets, 9 s low-clock, 4% reserve) drained
+# the clock to 1.6 s with 19 s moves under the 1.5x clocktest charge; the numbers above
+# are the tamed values -- read them off RESERVE_FRACTION_V6 / LOW_CLOCK_V6 / _budget_v6,
+# not off this paragraph, which has been wrong before. Absorbs TIME_V5's
+# 18-move floor. Needs COMPILED_SEARCH (per-root-move node counts from ctrl).
+TIME_V6: Final = True
+RESERVE_FRACTION_V6: Final = 0.06
+LOW_CLOCK_V6: Final = 12.0
+# LOW_CLOCK_EXTEND: below LOW_CLOCK_V6 the budget sets `hard = soft`, which collapses the
+# maximum onto the optimum and leaves `choose`'s stability / score-drop / node-effort rule
+# nothing to extend into. Measured over 31 lost and drawn games: 25 losing moves were played
+# under 12 s costing 6,012 cp, and 9 of them (1,466 cp, 3.6% of all value we lose) are ones
+# the engine finds the reference move for when given more time. This restores a maximum
+# above the optimum WITHOUT changing the optimum, so the average spend -- and therefore the
+# flag risk that `hard = soft` exists to control -- is unchanged; only the rare unstable
+# move can now run longer. Below LOW_CLOCK_FLOOR it stays in survival mode.
+LOW_CLOCK_EXTEND: Final = False
+LOW_CLOCK_FLOOR: Final = 6.0        # seconds; under this, hard = soft as before
+LOW_CLOCK_HARD_MULT: Final = 2.5    # same multiple the normal regime allows
+LOW_CLOCK_HARD_FRACTION: Final = 0.15
+_STABILITY_SCALE: Final = (1.2, 1.1, 1.0, 0.9, 0.8)  # Ethereal-style, capped at 4
+_INC_SAMPLES: list[float] = []  # observed increment, ms, last five moves
+# DRAW_BUDGET (rounds25-29 P2): round 27 spent 63.5 s -- 53% of the game clock --
+# on 61 moves whose reference evaluation was exactly 0. Once the root score has
+# hugged the draw score for six of our searches in a row, the halfmove clock is
+# past 20 and fourteen or fewer pieces remain, thinking harder does not change the
+# move: cap the soft budget near the observed increment and bank the clock for
+# a game that comes alive later. The hard deadline is never touched.
+DRAW_BUDGET: Final = False
+_DRAW_BAND: Final = 25          # |root score| that counts as holding the draw, cp
+_DRAW_MOVES: Final = 6          # consecutive own searches inside the band
+_DRAW_HMC: Final = 20           # halfmove clock that proves no progress either way
+# Round 31 (6 Sep) measured the narrow guards INERT: `pieces <= 10` and
+# `clock > 12` overlapped on ~3 of the 106 drawn shuffle moves that game, so the
+# cap never fired. Widened to 14 pieces / 8 s, which covers those 106 moves and
+# banks ~30-35 s. Widening makes it fire far more often, so this DOES NOT inherit
+# drawcap-clocktest-l's PASS: re-run the clocktest before it ships.
+_DRAW_PIECES: Final = 14
+_DRAW_MIN_CLOCK: Final = 8.0    # seconds left below which we never cap the budget
+_DRAW_CAP_FLOOR: Final = 0.25   # seconds, when the increment is still unobserved
+# CONVERT_BUDGET is DRAW_BUDGET's opposite sign: DRAW_BUDGET banks the clock in a proven
+# shuffle, this spends it on the two or three moves that decide a won position. The
+# conversion study (overnight/eval/v10/conversion.md) measured the case: 11 of 22 analysed
+# games reached reference >= +100 and NONE was won (0W/6D/5L); a median 75% of each
+# collapse is carried by ONE move of ours; `horizon` is the largest single cause in 5 of 10
+# of them; and 7 of 10 of those moves were played with over 20 s in hand. We spend 43.5% of
+# the clock on moves where |reference| < 30 and 4.1% on the moves at >= +150 -- the manager
+# is indifferent to winning, so the bank is never there when it matters.
+# WIN_FOCUS is the other half of the same finding, and the larger half. In `choose`,
+# TIME_V6 multiplies the soft budget by _STABILITY_SCALE (0.8 once the best move has
+# repeated) AND by the node-effort term max(0.5, 2.0 - 1.6 * fraction) (~0.56 when the
+# best move takes ~90% of the nodes). BOTH conditions are the definition of a won
+# position, so the two compound to ~0.45x exactly when we are winning. Measured against
+# the leaderboard leader on 521 of their own positions replayed through this engine
+# (overnight/eval/v10/opponent_profile.md): at +300..+800 they spend 1.55 s per move and
+# lose 8.4 cp; we spend 0.90 s and lose 23.0 cp. In LEVEL positions we are their exact
+# equal (5.9 vs 5.9) and when LOSING we are better (10.8 vs 27.1). We are only worse where
+# we have already won, and this is the mechanism that makes us so.
+WIN_FOCUS: Final = False
+CONVERT_BUDGET: Final = False
+_CONV_LO: Final = 120           # cp; root score at which a conversion is live
+_CONV_HI: Final = 900           # cp; above this the game wins itself
+_CONV_MOVES: Final = 2          # consecutive own searches inside the band
+_CONV_MULT: Final = 2.0         # multiplies BOTH soft and hard
+_CONV_MIN_CLOCK: Final = 20.0   # seconds left below which we never extend
+_CONV_MAX_FRACTION: Final = 0.16  # never more than this share of the clock on one move
+# Firing-rate instrumentation (conversion.md gate 4: the rate was unmeasurable). Off
+# unless AICH_CONV_LOG names a file; a fired extension appends one line to it.
+_CONV_LOG: Final = os.environ.get("AICH_CONV_LOG", "")
+_CONV_FIRES: Final[list[int]] = [0]
+_DRAW_SCORES: list[int] = []    # our root scores this game, newest last
+_DRAW_LAST_PLY: int = -1
+# ADJUDICATION: chess ply of the game's first request, and the last ply seen
+# (a ply that goes backwards means a new game in the same process).
+_MATCH_BASE_PLY: int = -1
+_LAST_GAME_PLY: int = -1
+_LAST_CLOCK_MS: float = -1.0
+_LAST_SPENT_MS: float = -1.0  # wall time of our previous get_move call
+_MAX_CLOCK_MS: float = 0.0
+# How often the search looks at the clock. time.monotonic() costs well under a
+# microsecond, so polling four times as often under TIME_V2 is free and quarters
+# the worst-case overrun past a deadline.
+_POLL_MASK: Final = 255 if TIME_V2 else 1023
+
+
+class Engine:
+    """Search state that persists for the lifetime of one game.
+
+    The platform starts one process per game and keeps it alive between moves, so
+    the transposition table and the repetition history survive from one of our moves
+    to the next. They do not survive to the next game, which is why this is built
+    per process rather than at module scope.
+    """
+
+    __slots__ = (
+        "acc",
+        "butterfly",
+        "deadline",
+        "history",
+        "killers",
+        "nodes",
+        "root_key",
+        "table",
+    )
+
+    def __init__(self) -> None:
+        # key -> (depth, score, flag, best_move); flag 0 exact, 1 lower, 2 upper.
+        self.table: dict[Hashable, tuple[int, int, int, chess.Move | None]] = {}
+        # Transposition keys of positions we have actually been asked about, so the
+        # search can recognise a repetition without paying 150 us to ask python-chess.
+        self.history: dict[Hashable, int] = {}
+        self.deadline = 0.0
+        self.nodes = 0
+        self.root_key: Hashable = None
+        self.acc = Accumulator()
+        # Two quiet moves per ply that last caused a beta cutoff there. They carry
+        # information the position alone does not, and cost nothing to try first.
+        self.killers: list[list[chess.Move | None]] = [[None, None] for _ in range(MAX_PLY)]
+        # from-square x to-square, credited by depth squared on a cutoff: a deeper
+        # cutoff is stronger evidence that a move is generally good.
+        self.butterfly: list[list[int]] = [[0] * 64 for _ in range(64)]
+
+    # -- evaluation ---------------------------------------------------------------
+
+    def evaluate(self, board: chess.Board) -> int:
+        """The learned evaluation, from the incrementally maintained accumulator."""
+        return self.acc.evaluate(board.turn, chess.popcount(board.occupied))
+
+    # -- move ordering ------------------------------------------------------------
+
+    def _order(
+        self, board: chess.Board, moves: list[chess.Move], best: chess.Move | None, ply: int
+    ) -> None:
+        """Sort moves in place: transposition move, then captures by MVV-LVA.
+
+        A transposition table earns about +100 Elo used this way and only about +40
+        used purely for cutoffs, so the previous iteration's best move going first
+        matters more than the table's stored bounds.
+        """
+        piece_type_at = board.piece_type_at
+        killers = self.killers[ply] if ply < MAX_PLY else [None, None]
+        butterfly = self.butterfly
+
+        def score(move: chess.Move) -> int:
+            if best is not None and move == best:
+                return 1 << 30
+            value = 0
+            victim = piece_type_at(move.to_square)
+            if victim is not None:
+                attacker = piece_type_at(move.from_square)
+                value = (
+                    CAPTURE_BONUS
+                    + _MVV[victim - 1] * 16
+                    - (_MVV[attacker - 1] if attacker is not None else 0)
+                )
+            elif move == killers[0]:
+                value = KILLER_FIRST
+            elif move == killers[1]:
+                value = KILLER_SECOND
+            else:
+                value = butterfly[move.from_square][move.to_square]
+            if move.promotion is not None:
+                value += PROMOTION_BONUS + move.promotion * 100
+            return value
+
+        moves.sort(key=score, reverse=True)
+
+    # -- quiescence ---------------------------------------------------------------
+
+    def quiesce(
+        self, board: chess.Board, alpha: int, beta: int, depth: int = 0, ply: int = 0
+    ) -> int:
+        """Search captures only, so evaluation never lands mid-exchange.
+
+        This is the largest single measured feature in the engine literature -- an
+        independent test put it at +347 Elo -- because without it every leaf score is
+        taken halfway through a trade and is simply wrong.
+        """
+        self.nodes += 1
+        if not self.nodes & _POLL_MASK and time.monotonic() > self.deadline:
+            raise Timeout
+
+        if QS_EVASIONS and depth < 8 and board.is_check():
+            # In check there is no "do nothing", so standing pat is a fiction, and the
+            # evaluation is untrained here besides: the packer drops every in-check
+            # position. Search the evasions; none at all is mate, on the true ply so
+            # it compares correctly with mates the main search found.
+            evasions = list(board.legal_moves)
+            if not evasions:
+                return -MATE + ply
+            self._order(board, evasions, None, 0)
+            best = -INFINITY
+            for move in evasions:
+                self.acc.push(board, move)
+                board.push(move)
+                try:
+                    score = -self.quiesce(board, -beta, -alpha, depth + 1, ply + 1)
+                finally:
+                    board.pop()
+                    self.acc.pop()
+                if score > best:
+                    best = score
+                    if score > alpha:
+                        alpha = score
+                        if alpha >= beta:
+                            break
+            return best
+
+        standing = self.evaluate(board)
+        if standing >= beta:
+            return standing
+        # If the best imaginable capture still falls short of alpha, nothing in this
+        # subtree can matter. One test, before generating any moves at all.
+        if standing + BIG_DELTA < alpha:
+            return standing
+        if standing > alpha:
+            alpha = standing
+        if depth >= 8:
+            return standing
+
+        captures = list(board.generate_legal_captures())
+        self._order(board, captures, None, 0)
+        for move in captures:
+            # Delta pruning: skip a capture that cannot reach alpha even generously.
+            victim = board.piece_type_at(move.to_square)
+            if (
+                victim is not None
+                and move.promotion is None
+                and standing + _MVV[victim - 1] + DELTA_MARGIN < alpha
+            ):
+                continue
+            self.acc.push(board, move)
+            board.push(move)
+            try:
+                score = -self.quiesce(board, -beta, -alpha, depth + 1, ply + 1)
+            finally:
+                board.pop()
+                self.acc.pop()
+            if score >= beta:
+                return score
+            if score > alpha:
+                alpha = score
+        return alpha
+
+    def _staged(
+        self, board: chess.Board, hash_move: chess.Move | None, ply: int
+    ) -> Iterator[chess.Move]:
+        """Yield the hash move first, and only then generate the rest.
+
+        Legal move generation costs ~28 us, about half of a node's time, and at a
+        node with a hash move that move produces the cutoff most of the time -- so
+        the list is only built if the search comes back for a second move. The key
+        identifies the position exactly, so a stored move is legal here; `is_legal`
+        is the guard against ever handing python-chess a move it would reject.
+        """
+        if hash_move is not None and board.is_legal(hash_move):
+            yield hash_move
+            moves = [move for move in board.legal_moves if move != hash_move]
+        else:
+            moves = list(board.legal_moves)
+        self._order(board, moves, None, ply)
+        yield from moves
+
+    # -- main search --------------------------------------------------------------
+
+    def search(self, board: chess.Board, depth: int, alpha: int, beta: int, ply: int) -> int:
+        """Fail-soft negamax with alpha-beta and a transposition table."""
+        self.nodes += 1
+        if not self.nodes & _POLL_MASK and time.monotonic() > self.deadline:
+            raise Timeout
+
+        # A position repeated inside the search, or one already seen in the game, is
+        # a draw we can claim -- the referee claims threefold automatically, so a
+        # winning side that shuffles will have the win taken away from it.
+        key = _key(board)
+        # REPETITION_TWOFOLD ships, so _REPEAT_LIMIT is 1, not 2: ONE prior sighting is
+        # already enough to bail out. The referee claims a threefold automatically, and a
+        # position we have seen once before plus this occurrence plus one more is a
+        # threefold we would not get to refuse -- so a winning side must not walk into it.
+        # (Under _REPEAT_LIMIT == 2 the rule would instead be "two prior sightings"; see
+        # the switch at REPETITION_TWOFOLD, and do not read this comment as describing it.)
+        if ply and (self.history.get(key, 0) >= _REPEAT_LIMIT or board.is_repetition(2)):
+            return 0
+
+        # Exact result for small material. WDL is 26-75 us warm, roughly two move
+        # generations, so it is affordable at every node once the board is small
+        # enough. `get_wdl` returns None rather than raising for a table we did not
+        # ship, and a crash is a lost game.
+        #
+        # Two subtleties. The fifty-move counter is checked first, because a
+        # theoretically won position whose clock has already expired is a draw and
+        # the referee will claim it. And Syzygy reports +/-1 for a *cursed* win --
+        # one that exists on the board but cannot be converted within fifty moves --
+        # which is likewise a draw in play, so only +/-2 counts.
+        if ply and board.halfmove_clock >= 100:
+            # Checkmate outranks the clock: a mate delivered on the hundredth
+            # halfmove is a win. `is_checkmate` is expensive, so it is only asked
+            # in this rare branch rather than at every node.
+            return -MATE + ply if board.is_checkmate() else 0
+        if _TABLEBASE is not None and ply and chess.popcount(board.occupied) <= TB_MEN:
+            wdl = _TABLEBASE.get_wdl(board)
+            if wdl is not None:
+                if wdl > 1:
+                    return TB_WIN - ply
+                if wdl < -1:
+                    return -TB_WIN + ply
+                return 0
+
+        original_alpha = alpha
+        stored = self.table.get(key)
+        best_move = None
+        if stored is not None:
+            stored_depth, raw_score, flag, best_move = stored
+            stored_score = _from_table(raw_score, ply)
+            if stored_depth >= depth and ply:
+                if flag == 0:
+                    return stored_score
+                if flag == 1 and stored_score > alpha:
+                    alpha = stored_score
+                elif flag == 2 and stored_score < beta:
+                    beta = stored_score
+                if alpha >= beta:
+                    return stored_score
+
+        in_check = board.is_check()
+        # Check extension. A position in check has a tiny, forcing move list, so the
+        # extra ply is cheap, and resolving the check is exactly where tactics live.
+        # Measured +55.7 +/- 14.9 -- and about +1 Elo in Stockfish, because it is a
+        # shallow-depth feature, which is all this engine has.
+        if in_check and ply < MAX_PLY - 8:
+            depth += 1
+
+        if depth <= 0:
+            return self.quiesce(board, alpha, beta, 0, ply)
+
+        # Reverse futility pruning. Not in check, because the evaluation of a
+        # position in check is unreliable -- the training data drops those
+        # positions entirely, so the network has never seen one. Under HYGIENE,
+        # not against a mate-bound window either: a static score can never answer
+        # "is this better than being mated", and returning one there hides mates.
+        if (
+            depth <= RFP_MAX_DEPTH
+            and not in_check
+            and (not HYGIENE or abs(beta) < DISTANCE_THRESHOLD)
+        ):
+            standing = self.evaluate(board)
+            if standing - RFP_MARGIN * depth >= beta:
+                return standing
+
+        # Null-move pruning. A null move leaves every piece where it is, so the
+        # accumulator does not change -- only whose perspective is "own", which
+        # evaluate() already takes from board.turn. Nothing to push or pop.
+        if (
+            depth >= NMP_MIN_DEPTH
+            and not in_check
+            and abs(beta) < DISTANCE_THRESHOLD
+            and _has_non_pawn_material(board, board.turn)
+        ):
+            board.push(chess.Move.null())
+            try:
+                score = -self.search(board, depth - 1 - NMP_REDUCTION, -beta, -beta + 1, ply + 1)
+            finally:
+                board.pop()
+            if score >= beta:
+                return beta
+
+        hash_move = best_move
+        candidates: Iterator[chess.Move]
+        if STAGED_MOVEGEN:
+            candidates = self._staged(board, hash_move, ply)
+        else:
+            moves = list(board.legal_moves)
+            if not moves:
+                return -MATE + ply if board.is_check() else 0
+            self._order(board, moves, hash_move, ply)
+            candidates = iter(moves)
+
+        best_score = -INFINITY
+        best_move = None
+        searched = 0
+        for move in candidates:
+            searched += 1
+            self.acc.push(board, move)
+            board.push(move)
+            try:
+                score = -self.search(board, depth - 1, -beta, -alpha, ply + 1)
+            finally:
+                board.pop()
+                self.acc.pop()
+            if score > best_score:
+                best_score = score
+                best_move = move
+                if score > alpha:
+                    alpha = score
+                    if alpha >= beta:
+                        # A quiet move that causes a cutoff is worth remembering:
+                        # here at this ply, and generally by from/to square.
+                        if board.piece_type_at(move.to_square) is None:
+                            slot = self.killers[ply] if ply < MAX_PLY else None
+                            if slot is not None and slot[0] != move:
+                                slot[1] = slot[0]
+                                slot[0] = move
+                            self.butterfly[move.from_square][move.to_square] += depth * depth
+                        break
+        if not searched:
+            # Only reachable on the staged path, which generates lazily.
+            return -MATE + ply if board.is_check() else 0
+
+        if len(self.table) >= MAX_TABLE:
+            # Always-replace with a hard ceiling. Dropping the table costs a little
+            # re-search; running out of memory costs the game.
+            self.table.clear()
+        if best_score <= original_alpha:
+            flag = 2
+        elif best_score >= beta:
+            flag = 1
+        else:
+            flag = 0
+        self.table[key] = (depth, _to_table(best_score, ply), flag, best_move)
+        return best_score
+
+    # -- driver -------------------------------------------------------------------
+
+    def choose(self, board: chess.Board, soft_limit: float, hard_limit: float) -> chess.Move:
+        """Iteratively deepen, keeping the best move from the last completed depth.
+
+        Iterative deepening is what makes the clock safe: there is always a legal
+        move to return the moment the budget runs out, and each pass orders the next.
+        """
+        self.deadline = hard_limit
+        moves = list(board.legal_moves)
+        best = moves[0]
+
+        if HYGIENE:
+            # Halve the history each move. It is never otherwise reset during a game,
+            # so without decay early preferences keep outranking what works now.
+            for row in self.butterfly:
+                for index in range(64):
+                    row[index] >>= 1
+
+        started = time.monotonic()
+        for depth in range(1, 64):
+            iteration_started = time.monotonic()
+            try:
+                score = -INFINITY
+                alpha = -INFINITY
+                self._order(board, moves, best, 0)
+                iteration_best = moves[0]
+                for move in moves:
+                    self.acc.push(board, move)
+                    board.push(move)
+                    try:
+                        value = -self.search(board, depth - 1, -INFINITY, -alpha, 1)
+                    finally:
+                        board.pop()
+                        self.acc.pop()
+                    if value > score:
+                        score = value
+                        iteration_best = move
+                        if value > alpha:
+                            alpha = value
+                best = iteration_best
+            except Timeout:
+                break
+
+            # A mate is found; deeper search cannot improve on it.
+            if score > MATE_THRESHOLD or score < -MATE_THRESHOLD:
+                break
+            now = time.monotonic()
+            if TIME_V2:
+                # The next iteration costs about one effective branching factor more
+                # than this one, so starting it merely because the soft limit has not
+                # passed yet means finishing it at the hard limit almost every move:
+                # measured, a mean spend of 3x the soft budget. Start it only if it is
+                # predicted to end within one and a half soft budgets.
+                elapsed = now - started
+                predicted = (now - iteration_started) * 2.5
+                if elapsed + predicted > 1.5 * (soft_limit - started):
+                    break
+            # Starting a further iteration that cannot finish only wastes clock.
+            elif now > soft_limit:
+                break
+
+        return best
+
+
+_ENGINE = Engine()
+
+
+# --------------------------------------------------------------------------------
+# The compiled board
+# --------------------------------------------------------------------------------
+# python-chess costs about six of the ten microseconds a node takes: ~28 us for a
+# legal move list, ~2.6 us per push and pop. fastboard.py is the same bitboard
+# representation compiled with numba -- the organisers' named fast path -- with
+# the accumulator update folded into make. FastEngine below is the same search as
+# Engine over that board. python-chess keeps the root: the FEN, the book, the
+# tablebase, and a legality check of every move before it leaves this file.
+#
+# Any exception on the compiled path, and any move it proposes that python-chess
+# does not accept, falls back to Engine for that move. The failure mode is a slower
+# move, never a lost game.
+FAST_BOARD: Final = True
+_FAST_OK = False
+# INIT_ASYNC's handle on the background compile: the thread while it is still
+# running, None once it has been joined (or was never started).
+_WARM_THREAD: threading.Thread | None = None
+_WARM_FAILED = False
+
+
+def _warm_search(fs: Any) -> None:
+    """Compile the search kernel. Runs on the import thread, or on INIT_ASYNC's."""
+    global _WARM_FAILED
+    try:
+        fs.warm_up(W1, B1, _W2T, B2, W3, B3, KING_ZONES)
+    except Exception:
+        # Same meaning as a synchronous failure: no compiled search this game. The
+        # joining move disables the fast path, which falls back to Engine.
+        _WARM_FAILED = True
+
+
+try:
+    if FAST_BOARD and _COMPILED:
+        import fastboard as _fb
+
+        # The two modules decide "is this net mirrored?" from separately resolved
+        # weights/net.npz paths -- agent.py from its own directory, fastboard.py from
+        # fastboard's. An engine directory carrying its own agent.py and weights/ but
+        # NOT its own fastboard.py (which is what night.sh's challenger() builds) makes
+        # them disagree, and zone_of then hands refresh() block indices for a W1 that
+        # was never doubled: measured exit 0xC0000409, no traceback, nothing catchable.
+        # The guard above only compares MIRRORED against KING_ZONES, which cannot see
+        # this. Dropping to the python engine is the right answer -- it uses agent.W1,
+        # which is self-consistent whichever way the disagreement runs -- and the
+        # except below prints "compiled board: off", so the fallback is visible.
+        if bool(getattr(_fb, "_F_MIRRORED", False)) != MIRRORED:
+            print(
+                f"mirroring mismatch: agent {MIRRORED} vs fastboard "
+                f"{getattr(_fb, '_F_MIRRORED', None)} -- {_fb.__file__} reads a different "
+                "weights/net.npz. Falling back to the python engine.",
+                file=sys.stderr,
+            )
+            raise RuntimeError("agent and fastboard disagree about mirroring")
+
+        # fastboard stays synchronous: FastEngine's own construction below calls into
+        # it, and it is ~3 s of the ~32. The search kernel is the 89%.
+        _fb.warm_up()
+        if COMPILED_SEARCH:
+            import fastsearch as _fs
+
+            if INIT_ASYNC:
+                _WARM_THREAD = threading.Thread(
+                    target=_warm_search, args=(_fs,), daemon=True, name="warm-search",
+                )
+                _WARM_THREAD.start()
+                _WARM_THREAD.join(max(0.0, INIT_READY_S - (time.monotonic() - _IMPORT_T0)))
+                if _WARM_THREAD.is_alive():
+                    # Hand the ready line to the runner now and finish on move one.
+                    print(f"init-async: ready at {time.monotonic() - _IMPORT_T0:.1f}s "
+                          "with the search kernel still compiling")
+                else:
+                    _WARM_THREAD = None
+                    if _WARM_FAILED:
+                        raise RuntimeError("warm_up failed")
+            else:
+                _warm_search(_fs)
+                if _WARM_FAILED:
+                    raise RuntimeError("warm_up failed")
+        _FAST_OK = True
+except Exception:
+    _FAST_OK = False
+
+
+class FastEngine:
+    """Engine's search over the compiled board. Moves are packed ints, keys are
+    polyglot Zobrist ints, and the position lives in fastboard.Position's arrays."""
+
+    __slots__ = (
+        "age",
+        "astack",
+        "black",
+        "bufs",
+        "butterfly",
+        "conthist1",
+        "corr",
+        "counter",
+        "ctrl",
+        "deadline",
+        "draw_root",
+        "ec_key",
+        "ec_val",
+        "exts",
+        "first_score",
+        "hint",
+        "history",
+        "killers",
+        "killers2",
+        "movebuf",
+        "nodes",
+        "pos",
+        "quiets",
+        "rep_keys",
+        "root_best",
+        "root_score",
+        "root_side",
+        "scores",
+        "scores2",
+        "scratch",
+        "table",
+        "tt",
+        "white",
+        "zones",
+    )
+
+    def __init__(self) -> None:
+        # key -> (depth, score, flag, move, age); flag 0 exact, 1 lower, 2 upper.
+        self.table: dict[int, tuple[int, int, int, int, int]] = {}
+        self.age = 0
+        self.history: dict[int, int] = {}
+        self.killers: list[list[int]] = [[0, 0] for _ in range(_fb.MAX_PLY)]
+        self.butterfly = np.zeros(8192, dtype=np.int32)
+        self.counter = np.zeros(4096, dtype=np.int32)
+        # CONT_HIST: (prev piece*64+to) x (piece*64+to), 2.3 MB, zeros when off
+        self.conthist1 = np.zeros(768 * 768, dtype=np.int32)
+        # 4 lanes of MAX_PLY: [0] extension count, [1] static eval, [2] piece*64+to
+        # of the move made at this ply (CONT_HIST), [3] spare; only lane 0 is read yet
+        self.exts = np.zeros(4 * _fb.MAX_PLY, dtype=np.int64)
+        self.ec_key = np.zeros(1, dtype=np.uint64)
+        self.ec_val = np.zeros(1, dtype=np.int32)
+        self.quiets = np.zeros((_fb.MAX_PLY, _fb.MOVE_CAP), dtype=np.int32)
+        self.corr = np.zeros((2, 1 << CORRECTION_BITS), dtype=np.int64)
+        # One move buffer per ply, sliced once: a fresh view per node is not free.
+        buffer = np.zeros((_fb.MAX_PLY, _fb.MOVE_CAP), dtype=np.int32)
+        self.bufs: list[npt.NDArray[np.int32]] = [buffer[i] for i in range(_fb.MAX_PLY)]
+        self.movebuf = buffer
+        # COMPILED_SEARCH state: array table, array killers, control block.
+        self.tt: tuple[Any, ...] = ()
+        self.killers2 = np.zeros((_fb.MAX_PLY, 2), dtype=np.int32)
+        self.scores2 = np.zeros((_fb.MAX_PLY, _fb.MOVE_CAP), dtype=np.int64)
+        self.scratch = np.zeros(2 * ACC_SIZE, dtype=np.float32)
+        self.ctrl = np.zeros(_fs.CTRL_SIZE if COMPILED_SEARCH else 32, dtype=np.int64)
+        self.rep_keys = np.zeros(0, dtype=np.uint64)
+        self.root_best = 0
+        self.root_score = -INFINITY  # last completed iteration's score (DRAW_BUDGET)
+        self.hint = 0  # a book move to search first and verify
+        self.first_score = -INFINITY
+        if COMPILED_SEARCH:
+            self.tt = _fs.new_table()
+            self.ec_key, self.ec_val = _fs.new_eval_cache()
+        self.scores = np.zeros(_fb.MOVE_CAP, dtype=np.int64)
+        self.white = B1.copy()
+        self.black = B1.copy()
+        self.astack = np.zeros((_fb.MAX_PLY, 2, ACC_SIZE), dtype=np.float32)
+        self.zones = np.zeros(2, dtype=np.int64)
+        self.pos = _fb.Position(chess.Board())
+        self.deadline = 0.0
+        self.nodes = 0
+        # Draw score from the root side's point of view, and which side that is.
+        self.draw_root = 0
+        self.root_side = 0
+
+    def _draw(self) -> int:
+        """What a draw is worth to the side to move at this node."""
+        if self.draw_root == 0:
+            return 0
+        return self.draw_root if self.pos.meta[0] == self.root_side else -self.draw_root
+
+    # -- primitives ---------------------------------------------------------------
+
+    def _make(self, move: int) -> None:
+        pos = self.pos
+        _fb.make_full(
+            pos.bb, pos.sq, pos.meta, pos.undo, pos.keys, move,
+            W1, B1, self.white, self.black, self.astack, self.zones, KING_ZONES,
+        )
+
+    def _unmake(self) -> None:
+        pos = self.pos
+        _fb.unmake_full(
+            pos.bb, pos.sq, pos.meta, pos.undo, pos.keys,
+            self.white, self.black, self.astack, self.zones,
+        )
+
+    def evaluate(self) -> int:
+        meta = self.pos.meta
+        if meta[0] == 0:
+            own, opponent = self.white, self.black
+        else:
+            own, opponent = self.black, self.white
+        pieces = int(meta[5])
+        k = _bucket(pieces)
+        score = int(
+            float(_eval_bucket_kernel(own, opponent, k, _W2T, B2, W3, B3, self.scratch))
+            * float(PIECE_SCALE[pieces])
+        )
+        # Mirror the kernel's ENDGAME_SHRINK blend so root contempt and any
+        # offline calibration see the number the tree actually plays.
+        if not ENDGAME_SHRINK or pieces >= _fs.EG_HI or abs(score) >= DISTANCE_THRESHOLD:
+            return score
+        wmin = ENDGAME_SHRINK_WMIN
+        if pieces <= _fs.EG_LO:
+            w = wmin
+        else:
+            w = wmin + (256 - wmin) * (pieces - _fs.EG_LO) // (_fs.EG_HI - _fs.EG_LO)
+        delta = (256 - w) * (int(_fs.simple_eval(self.pos.bb, meta)) - score) // 256
+        cap = ENDGAME_SHRINK_CAP
+        if cap > 0:
+            delta = max(-cap, min(cap, delta))
+        return score + delta
+
+    def corrected(self) -> tuple[int, int, int]:
+        """(raw static, static plus this pawn structure's correction, table index)."""
+        pos = self.pos
+        side = int(pos.meta[0])
+        index = int(_fb.pawn_index(pos.bb, CORRECTION_BITS))
+        raw = self.evaluate()
+        return raw, raw + int(self.corr[side, index]) // CORRECTION_GRAIN, index
+
+    # -- quiescence ---------------------------------------------------------------
+
+    def quiesce(self, alpha: int, beta: int, depth: int, ply: int) -> int:
+        self.nodes += 1
+        if not self.nodes & _POLL_MASK and time.monotonic() > self.deadline:
+            raise Timeout
+
+        standing = self.corrected()[1] if CORRECTION and CORRECTION_QS else self.evaluate()
+        if standing >= beta:
+            return standing
+        if standing + BIG_DELTA < alpha:
+            return standing
+        if standing > alpha:
+            alpha = standing
+        if depth >= 8 or ply >= _fb.MAX_PLY - 2:
+            return standing
+
+        pos = self.pos
+        sq = pos.sq
+        captures = self.bufs[ply]
+        n = _fb.gen_legal(pos.bb, sq, pos.meta, captures, True)
+        _fb.order_moves(captures, n, sq, 0, 0, 0, self.butterfly, self.scores)
+        for i in range(n):
+            move = int(captures[i])
+            victim = int(sq[(move >> 6) & 63])
+            if (
+                victim >= 0
+                and not (move >> 12)
+                and standing + _MVV[victim % 6] + DELTA_MARGIN < alpha
+            ):
+                continue
+            self._make(move)
+            try:
+                score = -self.quiesce(-beta, -alpha, depth + 1, ply + 1)
+            finally:
+                self._unmake()
+            if score >= beta:
+                return score
+            if score > alpha:
+                alpha = score
+        return alpha
+
+    # -- main search --------------------------------------------------------------
+
+    def search(self, depth: int, alpha: int, beta: int, ply: int) -> int:
+        self.nodes += 1
+        if not self.nodes & _POLL_MASK and time.monotonic() > self.deadline:
+            raise Timeout
+
+        pos = self.pos
+        bb = pos.bb
+        meta = pos.meta
+        keys = pos.keys
+        key = int(keys[meta[4]])
+
+        if ply:
+            if meta[3] >= 4 and (
+                self.history.get(key, 0) >= _REPEAT_LIMIT or _fb.repeats(meta, keys)
+            ):
+                return self._draw()
+            if meta[3] >= 100:
+                n = _fb.gen_legal(bb, pos.sq, meta, self.bufs[ply], False)
+                if n == 0 and _fb.in_check(bb, meta):
+                    return -MATE + ply
+                return self._draw()
+            if _TABLEBASE is not None and meta[5] <= TB_MEN:
+                wdl = _TABLEBASE.get_wdl(pos.to_board())
+                if wdl is not None:
+                    if wdl > 1:
+                        return TB_WIN - ply
+                    if wdl < -1:
+                        return -TB_WIN + ply
+                    return 0
+        if ply >= _fb.MAX_PLY - 8:
+            return self.evaluate()
+
+        original_alpha = alpha
+        stored = self.table.get(key)
+        hash_move = 0
+        if stored is not None:
+            stored_depth, raw_score, flag, hash_move, _ = stored
+            stored_score = _from_table(raw_score, ply)
+            if stored_depth >= depth and ply:
+                if flag == 0:
+                    return stored_score
+                if flag == 1 and stored_score > alpha:
+                    alpha = stored_score
+                elif flag == 2 and stored_score < beta:
+                    beta = stored_score
+                if alpha >= beta:
+                    return stored_score
+
+        in_check = bool(_fb.in_check(bb, meta))
+        if in_check and ply < MAX_PLY - 8:
+            depth += 1
+
+        if depth <= 0:
+            return self.quiesce(alpha, beta, 0, ply)
+
+        standing = -INFINITY
+        raw_standing = -INFINITY
+        corr_index = -1
+        if CORRECTION and not in_check:
+            # Every quiet node contributes to the correction table, so the static
+            # score is taken here regardless of depth.
+            raw_standing, standing, corr_index = self.corrected()
+        if (
+            depth <= RFP_MAX_DEPTH
+            and not in_check
+            and (not HYGIENE or abs(beta) < DISTANCE_THRESHOLD)
+        ):
+            if standing == -INFINITY:
+                standing = self.evaluate()
+            if (
+                TT_EVAL
+                and stored is not None
+                and abs(stored_score) < DISTANCE_THRESHOLD
+                and (
+                    flag == 0
+                    or (flag == 1 and stored_score > standing)
+                    or (flag == 2 and stored_score < standing)
+                )
+            ):
+                standing = stored_score
+            if standing - RFP_MARGIN * depth >= beta:
+                return standing
+
+        futile = False
+        if FUTILITY and depth <= 2 and not in_check and abs(alpha) < DISTANCE_THRESHOLD:
+            if standing == -INFINITY:
+                standing = self.evaluate()
+            futile = standing + FUTILITY_MARGIN[depth] <= alpha
+
+        if (
+            depth >= NMP_MIN_DEPTH
+            and not in_check
+            and abs(beta) < DISTANCE_THRESHOLD
+            and _fb.non_pawn_material(bb, int(meta[0]))
+            and (not NMP_GUARD or ply == 0 or pos.undo[meta[4] - 1, 0] != 0)
+        ):
+            _fb.make_null(bb, meta, pos.undo, keys)
+            try:
+                score = -self.search(depth - 1 - NMP_REDUCTION, -beta, -beta + 1, ply + 1)
+            finally:
+                _fb.unmake_null(meta, pos.undo)
+            if score >= beta:
+                return beta
+
+        moves = self.bufs[ply]
+        n = _fb.gen_legal(bb, pos.sq, meta, moves, False)
+        if n == 0:
+            return -MATE + ply if in_check else 0
+        killers = self.killers[ply]
+        _fb.order_moves(
+            moves, n, pos.sq, hash_move, killers[0], killers[1], self.butterfly, self.scores
+        )
+
+        best_score = -INFINITY
+        best_move = 0
+        searched = 0
+        sq = pos.sq
+        for i in range(n):
+            move = int(moves[i])
+            quiet = sq[(move >> 6) & 63] < 0
+            if futile and quiet and not (move >> 12):
+                # A quiet move from a position this far below alpha is not going to
+                # raise it; only captures and promotions get a look.
+                continue
+            self._make(move)
+            try:
+                if PVS and searched:
+                    score = -self.search(depth - 1, -alpha - 1, -alpha, ply + 1)
+                    if alpha < score < beta:
+                        score = -self.search(depth - 1, -beta, -alpha, ply + 1)
+                else:
+                    score = -self.search(depth - 1, -beta, -alpha, ply + 1)
+            finally:
+                self._unmake()
+            searched += 1
+            if score > best_score:
+                best_score = score
+                best_move = move
+                if score > alpha:
+                    alpha = score
+                    if alpha >= beta:
+                        if quiet:
+                            if killers[0] != move:
+                                killers[1] = killers[0]
+                                killers[0] = move
+                            self.butterfly[(move & 63) * 64 + ((move >> 6) & 63)] += depth * depth
+                        break
+
+        if not searched:
+            # Every move was futility-pruned: the position is at least as bad as
+            # the static score says, which is below alpha.
+            return standing
+
+        if len(self.table) >= MAX_TABLE:
+            if TT_AGE:
+                # Keep what this move and the last one learned; drop the rest.
+                age = self.age
+                self.table = {k: v for k, v in self.table.items() if v[4] >= age - 1}
+                if len(self.table) >= MAX_TABLE:
+                    self.table.clear()
+            else:
+                self.table.clear()
+        if best_score <= original_alpha:
+            flag = 2
+        elif best_score >= beta:
+            flag = 1
+        else:
+            flag = 0
+        if (
+            CORRECTION
+            and corr_index >= 0
+            and abs(best_score) < DISTANCE_THRESHOLD
+            and not (best_move >> 12)
+            and sq[(best_move >> 6) & 63] < 0
+            and (
+                flag == 0
+                or (flag == 1 and best_score > raw_standing)
+                or (flag == 2 and best_score < raw_standing)
+            )
+        ):
+            # The search disagreed with the static score in a direction the bound
+            # supports: move this pawn structure's entry toward the gap.
+            side = int(meta[0])
+            weight = min(depth + 1, CORRECTION_WEIGHT_MAX)
+            entry = int(self.corr[side, corr_index])
+            entry = (
+                entry * (CORRECTION_SCALE - weight)
+                + (best_score - raw_standing) * CORRECTION_GRAIN * weight
+            ) // CORRECTION_SCALE
+            cap = CORRECTION_CAP * CORRECTION_GRAIN
+            self.corr[side, corr_index] = max(-cap, min(cap, entry))
+        if TT_AGE:
+            old = self.table.get(key)
+            if old is not None and old[4] == self.age and old[0] > depth:
+                return best_score  # a deeper result from this same search stays
+        self.table[key] = (depth, _to_table(best_score, ply), flag, best_move, self.age)
+        return best_score
+
+    def root_search(self, depth: int, alpha: int, beta: int, ply: int) -> int:
+        """One search call from the root loop: the kernel or the Python search."""
+        if not COMPILED_SEARCH:
+            return self.search(depth, alpha, beta, ply)
+        pos = self.pos
+        ctrl = self.ctrl
+        if ctrl[_fs.C_STOP] != 0:
+            raise Timeout
+        ctrl[_fs.C_ABORT] = 0
+        if LAZY_ACC:
+            # The root makes are eager, so the accumulators are current here.
+            ctrl[_fs.C_ACC_PLY] = int(pos.meta[_fb.PLY])
+        score = _fs.search(  # type: ignore[call-arg]
+            pos.bb, pos.sq, pos.meta, pos.undo, pos.keys,
+            W1, B1, self.white, self.black, self.astack, self.zones, KING_ZONES,
+            _W2T, B2, W3, B3, *self.tt,
+            self.killers2, self.butterfly, self.movebuf, self.scores2, self.rep_keys,
+            ctrl, self.deadline, depth, alpha, beta, ply, self.scratch,
+            self.counter, self.quiets, self.ec_key, self.ec_val, self.exts, self.conthist1,
+            0,  # the root is a PV node, never an expected cut node
+        )
+        self.nodes = int(ctrl[_fs.C_NODES])
+        if ctrl[_fs.C_ABORT]:
+            raise Timeout
+        return int(score)
+
+    def predicted_reply(self, board: chess.Board) -> chess.Move | None:
+        """The move the transposition table holds for `board`, if any and legal."""
+        if not COMPILED_SEARCH or not self.tt:
+            return None
+        pos = _fb.Position(board)
+        key = pos.keys[0]
+        slot = int(key & _fs.TT_MASK)
+        if self.tt[0][slot] != key:
+            return None
+        packed = int(_fs.unpack_move(self.tt[1][slot]))
+        if not packed:
+            return None
+        move = chess.Move.from_uci(_fb.move_to_uci(packed))
+        return move if move in board.legal_moves else None
+
+    def prepare(self, board: chess.Board, draw_root: int) -> None:
+        """Load `board` as the root: accumulators, contempt, and the kernel's state."""
+        pos = self.pos
+        pos.load(board)
+        _fb.refresh(
+            pos.bb, pos.sq, pos.meta, W1, B1, self.white, self.black, self.zones, KING_ZONES
+        )
+        self.root_side = int(pos.meta[0])
+        self.draw_root = draw_root
+        if COMPILED_SEARCH:
+            ctrl = self.ctrl
+            ctrl[_fs.C_NODES] = 0
+            ctrl[_fs.C_ABORT] = 0
+            ctrl[_fs.C_AGE] = self.age
+            ctrl[_fs.C_ROOT_SIDE] = self.root_side
+            ctrl[_fs.C_DRAW_ROOT] = draw_root
+            ctrl[_fs.C_TT_OFF] = 0
+            ctrl[_fs.C_HYGIENE] = 1 if HYGIENE else 0
+            ctrl[_fs.C_FUTILITY] = 1 if FUTILITY else 0
+            ctrl[_fs.C_PVS] = 1 if PVS or LMR_AGGRESSIVE else 0
+            ctrl[_fs.C_LMR] = 1 if LMR else 0
+            ctrl[_fs.C_LMP] = 1 if LMP else 0
+            ctrl[_fs.C_SEE] = 1 if SEE else 0
+            ctrl[_fs.C_NMP_GUARD] = 1 if NMP_GUARD else 0
+            ctrl[_fs.C_RFP_PHASE] = 1 if RFP_PHASE else 0
+            ctrl[_fs.C_PH_LE8] = RFP_PHASE_PERCENT[0]
+            ctrl[_fs.C_PH_9_12] = RFP_PHASE_PERCENT[1]
+            ctrl[_fs.C_PH_13_16] = RFP_PHASE_PERCENT[2]
+            ctrl[_fs.C_PH_17_20] = RFP_PHASE_PERCENT[3]
+            ctrl[_fs.C_IIR] = 1 if IIR else 0
+            ctrl[_fs.C_HISTORY2] = 1 if HISTORY2 else 0
+            ctrl[_fs.C_TT_KEEP] = 1 if TT_KEEP else 0
+            ctrl[_fs.C_QS_CAP] = QS_CAP
+            ctrl[_fs.C_SAFE] = 1 if SAFE_BITS else 0
+            ctrl[_fs.C_QS_CACHE] = 1 if QS_EVAL_CACHE else 0
+            ctrl[_fs.C_SEE_MAIN] = 1 if SEE_MAIN else 0
+            ctrl[_fs.C_CHECK_CAP] = CHECK_EXT_CAP
+            ctrl[_fs.C_TT_BUCKETS] = 1 if TT_BUCKETS else 0
+            ctrl[_fs.C_LMR_AGGR] = 1 if LMR_AGGRESSIVE else 0
+            ctrl[_fs.C_LAZY_ACC] = 1 if LAZY_ACC else 0
+            ctrl[_fs.C_PRUNE2] = 1 if PRUNE_V2 else 0
+            ctrl[_fs.C_SINGULAR] = 1 if SINGULAR else 0
+            ctrl[_fs.C_EXCL_PLY] = -1
+            ctrl[_fs.C_HIST2_FIX] = 1 if HISTORY2_FIX else 0
+            ctrl[_fs.C_KILLER_CLEAR] = 1 if KILLER_CLEAR else 0
+            ctrl[_fs.C_CONT_HIST] = 1 if CONT_HIST else 0
+            ctrl[_fs.C_IMPROVING] = 1 if IMPROVING else 0
+            ctrl[_fs.C_CUTNODE] = 1 if CUTNODE else 0
+            ctrl[_fs.C_NMP_V2] = 1 if NMP_V2 else 0
+            ctrl[_fs.C_NMP_V2B] = 1 if NMP_V2B else 0
+            if CAPTURE_ORDER and CONT_HIST:
+                raise RuntimeError("CAPTURE_ORDER and CONT_HIST share the conthist1 buffer")
+            if KILLER_SHIFT and not KILLER_CLEAR:
+                raise RuntimeError("KILLER_SHIFT replaces KILLER_CLEAR's between-move clear")
+            ctrl[_fs.C_CAPTURE_ORDER] = 1 if CAPTURE_ORDER else 0
+            ctrl[_fs.C_QS_TT] = 1 if QS_TT else 0
+            ctrl[_fs.C_SEE_QUIET] = 1 if SEE_QUIET else 0
+            ctrl[_fs.C_SING_EXT2] = 1 if SINGULAR_EXT2 else 0
+            ctrl[_fs.C_RAZOR] = 1 if RAZOR else 0
+            ctrl[_fs.C_EG_SHRINK] = 1 if ENDGAME_SHRINK else 0
+            ctrl[_fs.C_EG_WMIN] = ENDGAME_SHRINK_WMIN
+            ctrl[_fs.C_EG_CAP] = ENDGAME_SHRINK_CAP
+            if INIT_FOLD:
+                for fold_slot, fold_value in _fs.FOLDED.items():
+                    if bool(ctrl[fold_slot]) != fold_value:
+                        raise RuntimeError(
+                            f"INIT_FOLD: ctrl slot {fold_slot} is {int(ctrl[fold_slot])} "
+                            f"but fastsearch folded it as {fold_value}"
+                        )
+            if KILLER_CLEAR:
+                if KILLER_SHIFT:
+                    # The root advanced two plies: killers[p] belonged to what is
+                    # now ply p - 2. Move them there and zero the two rows that
+                    # have no predecessor.
+                    self.killers2[:-2] = self.killers2[2:]
+                    self.killers2[-2:] = 0
+                else:
+                    self.killers2[:] = 0  # killers from the previous search are noise
+            ctrl[_fs.C_HMC_DRAW] = 100
+            if ADJUDICATION:
+                match_ply = _match_ply(board)
+                hmc = board.halfmove_clock
+                cap = PLATFORM_PLY_CAP if ADJ_V2 else ADJUDICATION_PLY
+                if (
+                    cap - match_ply <= ADJ_WINDOW
+                    and match_ply + (100 - hmc) <= cap
+                    and hmc + ADJ_HORIZON < 100
+                    and _material_balance(board) < 0
+                ):
+                    # Losing the material adjudication with a fifty-move draw
+                    # reachable before the cap: a horizon of non-zeroing plies
+                    # already scores as that draw.
+                    ctrl[_fs.C_HMC_DRAW] = hmc + ADJ_HORIZON
+            repeated = [k for k, count in self.history.items() if count >= _REPEAT_LIMIT]
+            self.rep_keys = np.array(repeated, dtype=np.uint64)
+
+    # -- driver -------------------------------------------------------------------
+
+    def choose(self, soft_limit: float, hard_limit: float) -> int:
+        self.deadline = hard_limit
+        pos = self.pos
+        moves = self.bufs[0]
+        n = _fb.gen_legal(pos.bb, pos.sq, pos.meta, moves, False)
+        if n == 0:
+            raise ValueError("no legal moves")
+        best = int(moves[0])
+        if SAFE_BITS and n == 1:
+            self.root_best = best
+            return best
+        hint = self.hint
+        if hint:
+            best = hint
+        self.first_score = -INFINITY
+
+        if HYGIENE:
+            self.butterfly >>= 1
+            if CONT_HIST or CAPTURE_ORDER:
+                self.conthist1 >>= 1  # same decay, or it saturates within a few moves
+
+        started = time.monotonic()
+        previous_best = 0
+        previous_score = -INFINITY
+        unstable = False
+        stable_streak = 0
+        stability = 0  # TIME_V6: consecutive iterations that kept the best move
+        score_hist: list[int] = []  # TIME_V6: one score per completed iteration
+        prev_scores: dict[int, int] = {}
+        last_nodes: dict[int, int] = {}
+        for depth in range(1, 64):
+            iteration_started = time.monotonic()
+            first_done = False
+            iteration_best = best
+            pass_scores: dict[int, int] = {}
+            # nodes spent under each root move: TIME_V6's effort factor and
+            # ROOT_NODES' ordering both read it.
+            root_nodes: dict[int, int] = {}
+            prev_nodes = last_nodes
+            # ASPIRATION: a window around the last score, or the full window.
+            window = 0
+            if ASPIRATION and depth >= 4 and abs(previous_score) < MATE_THRESHOLD:
+                window = ASPIRATION_WINDOW
+            lo = previous_score - window if window else -INFINITY
+            hi = previous_score + window if window else INFINITY
+            fails = 0
+            try:
+                while True:
+                    score = -INFINITY
+                    alpha = lo
+                    failed_high = False
+                    front = hint if hint else best
+                    if ROOT_ORDER and prev_scores:
+                        if ROOT_NODES and prev_nodes:
+                            ranked = [
+                                (
+                                    int(moves[i]) != front,
+                                    -prev_nodes.get(int(moves[i]), -1),
+                                    -prev_scores.get(int(moves[i]), -INFINITY),
+                                    i,
+                                )
+                                for i in range(n)
+                            ]
+                        else:
+                            ranked = [
+                                (
+                                    int(moves[i]) != front,
+                                    -prev_scores.get(int(moves[i]), -INFINITY),
+                                    0,
+                                    i,
+                                )
+                                for i in range(n)
+                            ]
+                        ranked.sort()
+                        moves[:n] = moves[:n][[r[3] for r in ranked]]
+                    else:
+                        _fb.order_moves(
+                            moves, n, pos.sq, front, 0, 0, self.butterfly, self.scores
+                        )
+                    iteration_best = int(moves[0])
+                    first_done = False
+                    root_in_check = bool(_fb.in_check(pos.bb, pos.meta)) if ROOT_LMR else False
+                    for i in range(n):
+                        move = int(moves[i])
+                        node_start = (
+                            int(self.ctrl[_fs.C_NODES]) if TIME_V6 or ROOT_NODES else 0
+                        )
+                        self._make(move)
+                        try:
+                            root_r = 0
+                            if (
+                                ROOT_LMR
+                                and i >= ROOT_LMR_MIN_MOVE
+                                and depth >= ROOT_LMR_MIN_DEPTH
+                                and not root_in_check
+                            ):
+                                root_r = 2 if i >= ROOT_LMR_DEEP_MOVE else 1
+                                root_r = min(root_r, depth - 2)
+                            if root_r > 0:
+                                # Reduced, null window. Only a move that beats alpha earns
+                                # the full-depth search, so the cost of being wrong is one
+                                # re-search, not a wrong score.
+                                value = -self.root_search(
+                                    depth - 1 - root_r, -alpha - 1, -alpha, 1
+                                )
+                                if value > alpha:
+                                    value = -self.root_search(
+                                        depth - 1, -alpha - 1, -alpha, 1
+                                    )
+                                    if alpha < value < hi:
+                                        value = -self.root_search(depth - 1, -hi, -alpha, 1)
+                            elif (PVS or LMR_AGGRESSIVE) and i:
+                                value = -self.root_search(depth - 1, -alpha - 1, -alpha, 1)
+                                if alpha < value < hi:
+                                    value = -self.root_search(depth - 1, -hi, -alpha, 1)
+                            else:
+                                value = -self.root_search(depth - 1, -hi, -alpha, 1)
+                        finally:
+                            self._unmake()
+                            if TIME_V6 or ROOT_NODES:
+                                root_nodes[move] = (
+                                    root_nodes.get(move, 0)
+                                    + int(self.ctrl[_fs.C_NODES]) - node_start
+                                )
+                        if ROOT_ORDER and not (root_r > 0 and value <= alpha):
+                            # Dropping a reduced fail-low is an extra root PRUNING heuristic,
+                            # not a safety fix -- be honest about which. `pass_scores` is
+                            # fresh per depth, and the sort key `-prev_scores.get(move,
+                            # -INFINITY)` is +1048576 for a move with no entry against an
+                            # ascending sort, so a dropped move goes LAST, behind every move
+                            # that did record a score. Demoting it to the back is exactly
+                            # what makes this pruning rather than a cost. Measured
+                            # against writing the bound: 559,703 vs 608,751 nodes, 12/16 vs
+                            # 11/16 root best moves. Best of the three variants tried.
+                            pass_scores[move] = value
+                        if i == 0:
+                            # A first move that fell out of the window proves nothing
+                            # about the others; with the full window this is always true.
+                            first_done = value > lo
+                            first_value = value
+                        if value > score:
+                            score = value
+                            iteration_best = move
+                            if value > alpha:
+                                alpha = value
+                                if alpha >= hi:
+                                    failed_high = True
+                                    break
+                    if hint and first_done:
+                        self.first_score = first_value
+                    if not window:
+                        break
+                    fails += 1
+                    if failed_high:
+                        # The move that failed high is proven better than the old best:
+                        # it leads the wider pass, and TIME_V4 may keep it.
+                        best = iteration_best
+                        if ASP_WIDE:
+                            hi = (
+                                INFINITY if fails >= 10
+                                else min(INFINITY, score + window * 3**fails // 2**fails)
+                            )
+                        else:
+                            hi = (
+                                INFINITY if fails >= 3
+                                else min(INFINITY, score + window * 4**fails)
+                            )
+                    elif score <= lo:
+                        if ASP_WIDE:
+                            lo = (
+                                -INFINITY if fails >= 10
+                                else max(-INFINITY, score - window * 3**fails // 2**fails)
+                            )
+                        else:
+                            lo = (
+                                -INFINITY if fails >= 3
+                                else max(-INFINITY, score - window * 4**fails)
+                            )
+                    else:
+                        break
+                best = iteration_best
+                if ROOT_ORDER:
+                    prev_scores = pass_scores
+                    if ROOT_NODES:
+                        last_nodes = root_nodes
+            except Timeout:
+                # The first root move is the previous best, searched with a full
+                # window; a later move that came back above alpha at this depth has
+                # beaten it at this depth, and is the better answer.
+                if TIME_V4 and first_done and iteration_best != best:
+                    best = iteration_best
+                break
+
+            if score > MATE_THRESHOLD or score < -MATE_THRESHOLD:
+                break
+            if TIME_V3:
+                # A best move that changed, or a score that fell, means the last
+                # ply revised the verdict: the next one may revise it again.
+                unstable = depth >= 3 and (
+                    best != previous_best or score < previous_score - 50
+                )
+                stable_streak = stable_streak + 1 if depth >= 3 and not unstable else 0
+                stability = stability + 1 if depth >= 3 and best == previous_best else 0
+                previous_best, previous_score = best, score
+            now = time.monotonic()
+            if TIME_V6:
+                score_hist.append(score)
+                elapsed = now - started
+                budget = soft_limit - started
+                factor = 1.0
+                if depth >= 5:
+                    factor = _STABILITY_SCALE[min(stability, 4)]
+                    if len(score_hist) >= 4:
+                        drop = score_hist[-4] - score_hist[-1]
+                        factor *= 2.0 ** (max(-100, min(100, drop)) / 100.0)
+                    total_nodes = sum(root_nodes.values())
+                    if total_nodes > 0:
+                        fraction = root_nodes.get(best, 0) / total_nodes
+                        factor *= max(0.5, 2.0 - 1.6 * fraction)
+                    factor = max(0.4, min(1.5, factor))
+                    if WIN_FOCUS and _CONV_LO <= score <= _CONV_HI:
+                        # Never throttle while a win is live: stability and node-effort
+                        # both read "decided" here, and that is precisely wrong.
+                        factor = max(factor, 1.0)
+                if elapsed > factor * budget:
+                    break
+            elif TIME_V2:
+                elapsed = now - started
+                budget = soft_limit - started
+                predicted = (now - iteration_started) * 2.5
+                allowance = 2.5 if unstable else 1.5
+                # TIME_V5 refund: two settled iterations in a row and the next
+                # one must fit inside one soft budget, not one and a half.
+                if TIME_V5 and stable_streak >= 2:
+                    allowance = 1.0
+                if elapsed + predicted > allowance * budget:
+                    break
+            elif now > soft_limit:
+                break
+
+        # The book move was searched first with a full window, so its score is
+        # exact; keep it unless the search found something clearly better.
+        if (
+            hint
+            and best != hint
+            and self.first_score > -INFINITY
+            and score - self.first_score <= BOOK_VERIFY_MARGIN
+        ):
+            best = hint
+        self.root_best = best
+        # The last completed iteration's verdict; -INFINITY when depth 3 never
+        # finished, which keeps DRAW_BUDGET's band test safely false.
+        self.root_score = int(previous_score)
+        return best
+
+    def play(self, board: chess.Board, soft_limit: float, hard_limit: float) -> chess.Move:
+        """Search `board` and return the move as python-chess understands it."""
+        pos = self.pos
+        pos.load(board)
+        _fb.refresh(
+            pos.bb, pos.sq, pos.meta, W1, B1, self.white, self.black, self.zones, KING_ZONES
+        )
+        self.age += 1
+        self.prepare(board, _contempt(board, self.evaluate()) if CONTEMPT else 0)
+        move = self.choose(soft_limit, hard_limit)
+        return chess.Move.from_uci(_fb.move_to_uci(move))
+
+
+_FAST: FastEngine | None = None
+_PONDER: FastEngine | None = None
+_PONDER_THREAD: threading.Thread | None = None
+_PONDER_STARTED: float = 0.0
+_PONDER_LAST_NODES: int = 0
+_SEARCHED_MOVES: int = 0  # requests answered by the search (not the book or a tablebase)
+_FALLBACK_SAID: bool = False  # so a repeated mid-move failure costs one line, not a hundred
+if _FAST_OK:
+    try:
+        _FAST = FastEngine()
+        if PONDER and COMPILED_SEARCH:
+            _PONDER = FastEngine()
+            _PONDER.tt = _FAST.tt  # one table, warmed by whichever engine is searching
+            _PONDER.history = _FAST.history
+    except Exception:  # an init failure would lose every game; a fallback loses none
+        _FAST = None
+        _PONDER = None
+
+
+def _ponder_target(board: chess.Board) -> None:
+    """Search `board` on the opponent's time until told to stop. Only the shared
+    table is kept; the move it finds is never played."""
+    engine = _PONDER
+    main = _FAST
+    if engine is None or main is None:
+        return
+    try:
+        engine.age = main.age
+        engine.prepare(board, 0)
+        limit = time.monotonic() + PONDER_MAX_S
+        engine.choose(limit, limit)
+    except Exception:  # pondering is a bonus; nothing here may reach the game
+        pass
+
+
+def _stop_ponder() -> None:
+    global _PONDER_THREAD
+    thread = _PONDER_THREAD
+    if thread is None:
+        return
+    if _PONDER is not None:
+        _PONDER.ctrl[_fs.C_STOP] = 1
+    thread.join(0.5)
+    _PONDER_THREAD = None
+
+
+def _start_ponder(board: chess.Board) -> None:
+    """`board` is the position after our move. Ponder the reply the table
+    expects, or the position itself when it holds none."""
+    global _PONDER_THREAD
+    if _PONDER is None or _FAST is None:
+        return
+    try:
+        target = board.copy()
+        reply = _FAST.predicted_reply(target)
+        if reply is not None:
+            target.push(reply)
+        if not target.legal_moves:
+            return
+        _PONDER.ctrl[_fs.C_STOP] = 0
+        thread = threading.Thread(target=_ponder_target, args=(target,), daemon=True)
+        _PONDER_THREAD = thread
+        global _PONDER_STARTED
+        _PONDER_STARTED = time.monotonic()
+        thread.start()
+    except Exception:
+        _PONDER_THREAD = None
+# The platform shows import-time output in the validation log, so this is how to
+# see from the dashboard whether the compiled path came up on their image.
+print(f"compiled board: {'on' if _FAST is not None else 'off'}")
+
+
+def _book_move(board: chess.Board) -> chess.Move | None:
+    """A book move for this position, sampled by how often humans played it."""
+    if _BOOK is None:
+        return None
+    try:
+        entries = [entry for entry in _BOOK.find_all(board) if entry.weight > 0]
+    except Exception:  # a corrupt book must not cost the game
+        return None
+    if not entries:
+        return None
+    best = max(entry.weight for entry in entries)
+    viable = [entry for entry in entries if entry.weight >= best * BOOK_MIN_SHARE]
+    total = sum(entry.weight for entry in viable)
+    pick = _RANDOM.randrange(total)
+    for entry in viable:
+        pick -= entry.weight
+        if pick < 0:
+            return entry.move
+    return viable[0].move
+
+
+def _tablebase_move(board: chess.Board) -> chess.Move | None:
+    """The best move when the whole position is tabulated.
+
+    WDL says who wins. DTZ says how many plies until the next pawn move or capture,
+    which keeps play safe against the fifty-move rule -- but it is *not* a distance
+    to mate, and that distinction is the whole difficulty. In KPvK every winning
+    move reports the same DTZ, so DTZ alone leaves the choice arbitrary and the
+    engine shuffles: measured, it drew a won KPvK while the halfmove clock climbed
+    to 18 without progress.
+
+    Worse, minimising DTZ actively blocks the winning plan. Promoting a pawn raises
+    DTZ, because after a queen appears the next capture is far away -- so a
+    DTZ-first ranking marched the a-pawn to a7 and then refused to queen it,
+    shuffling the king instead until the game was drawn.
+
+    A zeroing move resets the fifty-move clock, which makes the DTZ of the position
+    it leads to irrelevant. So zeroing ranks *above* DTZ: among moves that keep the
+    win, prefer to reset the clock, then keep DTZ small, then drive the defending
+    king toward a corner and bring our own king closer. The last two are the classic
+    mate-driver, and this order converges for every ending in a 4-man set.
+    """
+    if _TABLEBASE is None or chess.popcount(board.occupied) > TB_MEN:
+        return None
+
+    best: chess.Move | None = None
+    best_key: tuple[int, ...] | None = None
+    for move in board.legal_moves:
+        zeroing = board.is_zeroing(move)
+        board.push(move)
+        try:
+            if board.is_checkmate():
+                key: tuple[int, ...] = (-3, 0, 0, 0, 0)
+            else:
+                # After our move the opponent is to move, so a negative wdl here
+                # means they are lost and we are winning.
+                wdl = _TABLEBASE.get_wdl(board)
+                dtz = _TABLEBASE.get_dtz(board)
+                if wdl is None or dtz is None:
+                    return None
+                defender = board.king(board.turn)
+                attacker = board.king(not board.turn)
+                if defender is None or attacker is None:
+                    return None
+                corner = min(
+                    chess.square_distance(defender, c)
+                    for c in (chess.A1, chess.A8, chess.H1, chess.H8)
+                )
+                key = (
+                    wdl,
+                    0 if zeroing else 1,
+                    abs(dtz) if wdl < 0 else -abs(dtz),
+                    corner,
+                    chess.square_distance(defender, attacker),
+                )
+        finally:
+            board.pop()
+        if best_key is None or key < best_key:
+            best_key, best = key, move
+    return best
+
+
+def _has_non_pawn_material(board: chess.Board, colour: chess.Color) -> bool:
+    """Whether `colour` has a piece other than king and pawns.
+
+    Null-move pruning assumes that having the move is worth something. In a king
+    and pawn endgame that is false -- zugzwang means the obligation to move can
+    itself be losing -- so the pruning is disabled there.
+    """
+    return bool(
+        board.pieces_mask(chess.KNIGHT, colour)
+        | board.pieces_mask(chess.BISHOP, colour)
+        | board.pieces_mask(chess.ROOK, colour)
+        | board.pieces_mask(chess.QUEEN, colour)
+    )
+
+
+def _note_clock(time_left_ms: int) -> None:
+    """Track the largest clock seen: the starting clock, which is never passed in."""
+    global _MAX_CLOCK_MS, _LAST_CLOCK_MS
+    if time_left_ms > _MAX_CLOCK_MS:
+        _MAX_CLOCK_MS = float(time_left_ms)
+    if TIME_V6:
+        if _LAST_CLOCK_MS >= 0.0 and _LAST_SPENT_MS >= 0.0:
+            raw = time_left_ms - (_LAST_CLOCK_MS - _LAST_SPENT_MS)
+            if -50.0 <= raw <= 3000.0:  # a new game or a clock reset is out of range
+                _INC_SAMPLES.append(max(0.0, raw))
+                del _INC_SAMPLES[:-5]
+        _LAST_CLOCK_MS = float(time_left_ms)
+
+
+_MATERIAL: Final = {
+    chess.PAWN: 100, chess.KNIGHT: 300, chess.BISHOP: 300, chess.ROOK: 500, chess.QUEEN: 900
+}
+
+
+def _contempt(board: chess.Board, static: int) -> int:
+    """The draw score for the root side, negative when a draw would cost it.
+
+    Ahead on material or on the network's own view of the position, a draw is a
+    loss of expectation, and increasingly so as the ply cap approaches -- under
+    ADJUDICATION because the cap awards the game on raw material, under ADJ_V2
+    because the cap is a draw and takes a won game away. Behind, a draw is a
+    gain (a certain one under ADJ_V2: the cap draws whatever the material).
+    Level, a small reluctance to repeat: in a Swiss the opponent is usually the
+    weaker side, and playing on is where that shows.
+    """
+    material = _material_balance(board)
+    game_ply = _match_ply(board) if ADJUDICATION else (
+        2 * (board.fullmove_number - 1) + (0 if board.turn == chess.WHITE else 1)
+    )
+    cap = PLATFORM_PLY_CAP if ADJ_V2 else ADJUDICATION_PLY
+    late = min(1.0, max(0.0, (game_ply - cap / 2) / (cap / 2)))
+    if material >= 100 or static >= 60:
+        return -int(CONTEMPT_AHEAD + (CONTEMPT_AHEAD_LATE - CONTEMPT_AHEAD) * late)
+    if material <= -100 or static <= -60:
+        if ADJ_V2 and material < 0:
+            # The cap is a draw: we are not buying our way out of a loss, so a
+            # draw is worth a bounded preference, and only near the real cap.
+            return -CONTEMPT_BEHIND + int(ADJ_BEHIND_LATE_V2 * late)
+        if ADJUDICATION and material < 0:
+            # Losing the ply-300 material adjudication: a draw approaches a full
+            # half point as the cap nears, so make repetitions decisive, not +20.
+            return -CONTEMPT_BEHIND + int(ADJ_BEHIND_LATE * late)
+        return -CONTEMPT_BEHIND
+    return -CONTEMPT_LEVEL
+
+
+def _material_balance(board: chess.Board) -> int:
+    """Raw material for the side to move, in cp; sign matches the referee's
+    ply-300 adjudication (its 1/3/3/5/9 scale times 100)."""
+    material = 0
+    for piece, value in _MATERIAL.items():
+        material += value * (
+            chess.popcount(board.pieces_mask(piece, chess.WHITE))
+            - chess.popcount(board.pieces_mask(piece, chess.BLACK))
+        )
+    return -material if board.turn == chess.BLACK else material
+
+
+def _match_ply(board: chess.Board) -> int:
+    """The referee's ply count, pinned at our first request of the game.
+
+    The referee counts plies from the curated start FEN; `fullmove_number`
+    counts from the real initial position and can run 13+ ahead. We cannot see
+    whether the opponent moved before our first request, so assume it did (at
+    most one ply conservative). A ply that goes backwards means a new game in
+    the same process: re-pin.
+    """
+    global _MATCH_BASE_PLY, _LAST_GAME_PLY
+    ply = 2 * (board.fullmove_number - 1) + (0 if board.turn == chess.WHITE else 1)
+    if _MATCH_BASE_PLY < 0 or ply < _LAST_GAME_PLY:
+        _MATCH_BASE_PLY = ply
+    _LAST_GAME_PLY = ply
+    return ply - _MATCH_BASE_PLY + 1
+
+
+def _note_draw_score(board: chess.Board, score: int) -> None:
+    """Record this game's root scores; a ply that goes backwards is a new game."""
+    global _DRAW_LAST_PLY
+    ply = 2 * (board.fullmove_number - 1) + (0 if board.turn == chess.WHITE else 1)
+    if ply <= _DRAW_LAST_PLY:
+        del _DRAW_SCORES[:]
+    _DRAW_LAST_PLY = ply
+    _DRAW_SCORES.append(score)
+    del _DRAW_SCORES[:-_DRAW_MOVES]
+
+
+def _draw_budget_soft(board: chess.Board, time_left_ms: int, soft: float) -> float:
+    """DRAW_BUDGET: the capped soft deadline for a proven-drawn shuffle, else `soft`."""
+    if (
+        len(_DRAW_SCORES) >= _DRAW_MOVES
+        and all(abs(s) <= _DRAW_BAND for s in _DRAW_SCORES)
+        and board.halfmove_clock > _DRAW_HMC
+        and chess.popcount(board.occupied) <= _DRAW_PIECES
+        and time_left_ms / 1000.0 > _DRAW_MIN_CLOCK
+    ):
+        cap = max(_DRAW_CAP_FLOOR, 0.8 * _observed_increment())
+        return min(soft, time.monotonic() + cap)
+    return soft
+
+
+def _convert_budget(time_left_ms: int, soft: float, hard: float) -> tuple[float, float]:
+    """CONVERT_BUDGET: extend BOTH deadlines while a win is live, capped by the clock share.
+
+    It must scale `hard`, not the stop rule. Round 31's decisive move spent 2.63 s against a
+    hard cap of 3.03 s -- 87% of everything the manager could legally give -- and `choose`'s
+    stability/score-drop/node-effort product multiplies `soft` only and is clamped to
+    [0.4, 1.5], so a stop-rule change would be inert on exactly the move it targets.
+    """
+    remaining = max(time_left_ms - 400.0, 50.0) / 1000.0
+    if (
+        len(_DRAW_SCORES) >= _CONV_MOVES
+        and all(_CONV_LO <= score <= _CONV_HI for score in _DRAW_SCORES[-_CONV_MOVES:])
+        and remaining > _CONV_MIN_CLOCK
+    ):
+        now = time.monotonic()
+        cap = now + remaining * _CONV_MAX_FRACTION
+        soft = min(now + (soft - now) * _CONV_MULT, cap)
+        hard = min(max(soft, now + (hard - now) * _CONV_MULT), cap)
+        if _CONV_LOG:
+            _CONV_FIRES[0] += 1
+            with open(_CONV_LOG, "a", encoding="utf-8") as handle:
+                handle.write(
+                    f"fire {_CONV_FIRES[0]} score {_DRAW_SCORES[-1]} "
+                    f"soft {soft - now:.2f} hard {hard - now:.2f} clock {remaining:.1f}\n"
+                )
+    return soft, hard
+
+
+def _observed_increment() -> float:
+    """The increment in seconds as seen between our calls; 0 until two samples."""
+    if len(_INC_SAMPLES) < 2:
+        return 0.0
+    ordered = sorted(_INC_SAMPLES)
+    return ordered[len(ordered) // 2] / 1000.0
+
+
+def _budget_v6(board: chess.Board, time_left_ms: int) -> tuple[float, float]:
+    """TIME_V6 deadlines: the soft budget is the ideal spend that the stop rule in
+    `choose` scales by stability, score drop and node effort; the hard deadline is
+    the only mid-iteration stop, 2.5 soft budgets or a tenth of the clock (and below
+    LOW_CLOCK_V6 it collapses onto the soft budget unless LOW_CLOCK_EXTEND is on)."""
+    now = time.monotonic()
+    remaining = max(time_left_ms - 400.0, 50.0) / 1000.0  # 400 ms for the watchdog
+    inc = _observed_increment()
+    expected = max(30.0, 56.0 - board.fullmove_number * 0.4)
+    if remaining < LOW_CLOCK_V6:
+        # An eighteenth of what is left, as a hard stop: with the kernel aborting at the
+        # deadline (TIME_V4 keeps the partial result) the spend is exact, so the clock
+        # settles where remaining/18 x charge = increment -- 6 s under the 1.5x
+        # clocktest charge (measured 5.1-6.3 s at /16), ~8 s on the platform.
+        soft = max(0.02, remaining / 18.0)
+        if LOW_CLOCK_EXTEND and remaining > LOW_CLOCK_FLOOR:
+            hard = max(soft, min(soft * LOW_CLOCK_HARD_MULT,
+                                 remaining * LOW_CLOCK_HARD_FRACTION))
+        else:
+            hard = soft
+    else:
+        soft = remaining / expected + 0.7 * inc
+        hard = min(remaining * 0.10, soft * 2.5)
+    reserve = _MAX_CLOCK_MS * RESERVE_FRACTION_V6 / 1000.0
+    if reserve > 0.0:
+        hard = min(hard, max(soft, remaining - reserve))
+    hard = max(hard, 0.02)
+    soft = min(soft, hard)
+    return now + soft, now + hard
+
+
+def _budget_v2(board: chess.Board, time_left_ms: int) -> tuple[float, float]:
+    """TIME_V2 deadlines. The soft budget is what a move should cost on average;
+    `choose` now stops deepening when the next iteration would overrun it, so the
+    hard limit is a genuine emergency stop rather than the usual spend.
+
+    Three bounds on one move: 12% of the clock, three soft budgets, and whatever
+    keeps the clock above the reserve. The reserve floor is `soft`, not zero --
+    once the clock is inside the reserve the right move is a normal one, not a
+    panicked 20 ms one that loses the game a different way.
+    """
+    now = time.monotonic()
+    remaining = max(time_left_ms - 400.0, 50.0) / 1000.0  # 400 ms for the watchdog
+
+    if TIME_V3:
+        expected = max(18.0 if TIME_V5 else 26.0, 46.0 - board.fullmove_number * 0.4)
+    else:
+        expected = max(20.0, 40.0 - board.fullmove_number * 0.5)
+    # Below LOW_CLOCK, live on the increment. Crediting half of it while the clock
+    # is low sets up an equilibrium where the clock settles at whatever level makes
+    # the spend equal the income -- measured at 4.4-4.6 s under a 1.5x charge, which
+    # is no margin at all. With no credit and a longer horizon the same equilibrium
+    # sits near 10 s charged 1.5x and near 14 s uncharged.
+    soft = remaining / 30.0 if remaining < LOW_CLOCK else remaining / expected + 0.25
+    hard = min(remaining * 0.12, soft * 3.0)
+    reserve = _MAX_CLOCK_MS * RESERVE_FRACTION / 1000.0
+    if reserve > 0.0:
+        hard = min(hard, max(soft, remaining - reserve))
+    hard = max(hard, 0.02)
+    soft = min(soft, hard)
+    return now + soft, now + hard
+
+
+def _budget(board: chess.Board, time_left_ms: int) -> tuple[float, float]:
+    """Return (soft, hard) monotonic deadlines for this move.
+
+    A flag is a full point and it is the most common self-inflicted loss in this
+    format, so the hard limit is deliberately conservative. The referee measures
+    wall time and applies the increment only *after* the move, so the increment
+    cannot be spent in advance; it is counted at a discount.
+    """
+    if TIME_V6:
+        return _budget_v6(board, time_left_ms)
+    if TIME_V2:
+        return _budget_v2(board, time_left_ms)
+    now = time.monotonic()
+    remaining = max(time_left_ms - 300.0, 50.0) / 1000.0  # 300 ms for the watchdog
+
+    # Expect fewer moves left as the game goes on, but never fewer than a floor:
+    # running out of estimated moves is how engines talk themselves into flagging.
+    expected = max(18.0, 42.0 - board.fullmove_number * 0.5)
+    soft = remaining / expected + 0.35 * (0.5 if remaining > 5.0 else 0.0)
+    hard = min(remaining * 0.35, soft * 4.0)
+    soft = min(soft, hard)
+    return now + soft, now + hard
+
+
+def _join_warmup(time_left_ms: int) -> int:
+    """Finish INIT_ASYNC's background compile and charge the wait to this move.
+
+    Import returned early so the runner could print its ready line inside the
+    platform's init budget; the clock starts at that line, so whatever the compile
+    still owes is spent here and has to come off the budget this move plans against.
+    Returns the clock we may actually still use.
+    """
+    global _WARM_THREAD, _FAST
+    thread = _WARM_THREAD
+    if thread is None:
+        return time_left_ms
+    started = time.monotonic()
+    thread.join()
+    _WARM_THREAD = None
+    if _WARM_FAILED:
+        _FAST = None  # no compiled search: Engine plays this game
+        # This fires AFTER the import-time "compiled board: on" line, so without a print
+        # the dashboard shows a healthy init for a game played at ~1/4 the nodes. Say so.
+        print(
+            "compiled search: FAILED to warm; playing this game on the python engine",
+            file=sys.stderr,
+        )
+    try:
+        left = int(time_left_ms) - int((time.monotonic() - started) * 1000.0)
+    except (TypeError, ValueError):
+        return time_left_ms
+    # Never claim more clock than we were given, and never plan against a negative
+    # one: a 200 ms floor returns a move instantly rather than flagging on arithmetic.
+    return max(200, left)
+
+
+def get_move(fen: str, time_left_ms: int) -> str:
+    """Return a legal move in UCI notation; the platform's entry point."""
+    global _LAST_SPENT_MS
+    started = time.monotonic()
+    try:
+        if INIT_ASYNC and _WARM_THREAD is not None:
+            time_left_ms = _join_warmup(time_left_ms)
+        return _get_move(fen, time_left_ms)
+    finally:
+        _LAST_SPENT_MS = (time.monotonic() - started) * 1000.0
+
+
+def _get_move(fen: str, time_left_ms: int) -> str:
+    """Return a legal move in UCI notation.
+
+    fen           the position to move in; your colour is the side to move
+    time_left_ms  your clock before this move, in milliseconds
+    returns       "e2e4", or "e7e8q" for a promotion
+    """
+    board = chess.Board(fen)
+    # The contract says an int; a float or a numeric string is cheaper to accept
+    # than to lose a game over.
+    try:
+        time_left_ms = int(time_left_ms)
+    except (TypeError, ValueError):
+        time_left_ms = 1000
+
+    # Remember every position we have been asked about. The referee claims threefold
+    # repetition automatically, so an engine that is winning and shuffling can have a
+    # won game turned into a draw without ever being told.
+    # A position with no legal moves is checkmate or stalemate, and the referee is
+    # not supposed to ask about one. If it ever does, every path below raises --
+    # `moves[0]` in the search, `next(iter(...))` in the fallback -- and an exception
+    # here forfeits the game. UCI's null move is the honest answer.
+    if not board.legal_moves:
+        return "0000"
+
+    if PONDER:
+        had_thread = _PONDER_THREAD is not None
+        _stop_ponder()
+        global _PONDER_LAST_NODES
+        _PONDER_LAST_NODES = 0
+        if had_thread and _PONDER is not None:
+            _PONDER_LAST_NODES = int(_PONDER.ctrl[_fs.C_NODES])
+        if PONDER_DIAG and had_thread and _PONDER is not None:
+            gap = time.monotonic() - _PONDER_STARTED
+            print(f"ponder-diag: gap {gap:.2f}s ponder_nodes {_PONDER_LAST_NODES}")
+    if TIME_V2:
+        _note_clock(time_left_ms)
+
+    key = _key(board)
+    _ENGINE.history[key] = _ENGINE.history.get(key, 0) + 1
+    if _FAST is not None:
+        fast_key = chess.polyglot.zobrist_hash(board)
+        _FAST.history[fast_key] = _FAST.history.get(fast_key, 0) + 1
+
+    # Book first: it is instant, and the clock it saves is worth more in the
+    # middlegame than the search would be worth here.
+    try:
+        opening = _book_move(board) if BOOK_ENABLED else None
+    except Exception:  # never let the book cost a game
+        opening = None
+    if opening is not None and not (BOOK_VERIFY and _FAST is not None):
+        if PONDER and _PONDER is not None:
+            try:
+                board.push(opening)
+                _start_ponder(board)
+                board.pop()
+            except Exception:
+                pass
+        return opening.uci()
+
+    # Exact play once the position is small enough. This is what converts a won
+    # endgame; the search alone shuffles because the evaluation is flat there.
+    try:
+        exact = _tablebase_move(board)
+    except Exception:
+        exact = None
+    if exact is not None:
+        return exact.uci()
+
+    move: chess.Move | None = None
+    started = time.monotonic()
+    if _FAST is not None:
+        # The compiled board. A move python-chess would reject, or any exception,
+        # hands this move to the python-chess engine instead.
+        try:
+            soft, hard = _budget(board, time_left_ms)
+            if DRAW_BUDGET:
+                soft = _draw_budget_soft(board, time_left_ms, soft)
+            if CONVERT_BUDGET:
+                soft, hard = _convert_budget(time_left_ms, soft, hard)
+            _FAST.hint = _fb.move_from_chess(opening) if opening is not None else 0
+            global _SEARCHED_MOVES
+            _SEARCHED_MOVES += 1
+            if PONDER_PROBE and 2 <= _SEARCHED_MOVES <= 4 and time_left_ms > 30_000:
+                fixed = 1.0 if _PONDER_LAST_NODES >= 100_000 else 3.0
+                soft = hard = time.monotonic() + fixed
+            candidate = _FAST.play(board, soft, hard)
+            if DRAW_BUDGET or CONVERT_BUDGET:   # either switch needs the root-score feed
+                _note_draw_score(board, int(_FAST.root_score))
+            if candidate in board.legal_moves:
+                move = candidate
+        except Exception:
+            move = None
+            global _FALLBACK_SAID
+            if not _FALLBACK_SAID:
+                _FALLBACK_SAID = True
+                print("compiled search: raised mid-move; python fallback", file=sys.stderr)
+
+    if move is None:
+        # refresh() and _budget() were outside this guard, so an exception in either
+        # was a crash rather than a fallback -- and a crash is a lost game where a
+        # legal move would only have been a bad one. Nothing in here is worth a point.
+        # The fallback budgets from what is left after the compiled attempt, not
+        # from the clock as it stood when the move began.
+        try:
+            spent = int((time.monotonic() - started) * 1000.0)
+            _ENGINE.acc.refresh(board)
+            soft, hard = _budget(board, max(time_left_ms - spent, 50))
+            move = _ENGINE.choose(board, soft, hard)
+        except Exception:
+            print("both engines raised; returning the first legal move", file=sys.stderr)
+            return next(iter(board.legal_moves)).uci()
+
+    if HYGIENE:
+        # The position after our move counts toward a threefold claim just as much
+        # as the ones we are asked about, and nothing else ever records it.
+        try:
+            board.push(move)
+            after = _key(board)
+            _ENGINE.history[after] = _ENGINE.history.get(after, 0) + 1
+            if _FAST is not None:
+                fast_after = chess.polyglot.zobrist_hash(board)
+                _FAST.history[fast_after] = _FAST.history.get(fast_after, 0) + 1
+            board.pop()
+        except Exception:
+            pass
+    if PONDER and _PONDER is not None:
+        try:
+            board.push(move)
+            _start_ponder(board)
+            board.pop()
+        except Exception:
+            pass
+    return move.uci()

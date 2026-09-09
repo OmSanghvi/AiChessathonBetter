@@ -1,0 +1,64 @@
+[
+ {
+  "name": "v94-vs-sf8-120s",
+  "kind": "switch",
+  "sed": "",
+  "champion": "opponents/sf-skill8",
+  "games": 60,
+  "workers": 4,
+  "base_ms": 120000,
+  "openings": "platform",
+  "elo0": -200,
+  "elo1": 200
+ },
+ {
+  "name": "165-v96",
+  "sed": "s/^DRAW_BUDGET: Final = False$/DRAW_BUDGET: Final = True/; s/^CUTNODE: Final = False$/CUTNODE: Final = True/; s/^SEE_QUIET: Final = False$/SEE_QUIET: Final = True/",
+  "games": 600
+ },
+ {
+  "name": "v96-clocktest-l",
+  "kind": "clocktest",
+  "sed": "s/^DRAW_BUDGET: Final = False$/DRAW_BUDGET: Final = True/; s/^CUTNODE: Final = False$/CUTNODE: Final = True/; s/^SEE_QUIET: Final = False$/SEE_QUIET: Final = True/"
+ },
+ {
+  "name": "v96-120s",
+  "kind": "switch",
+  "sed": "s/^DRAW_BUDGET: Final = False$/DRAW_BUDGET: Final = True/; s/^CUTNODE: Final = False$/CUTNODE: Final = True/; s/^SEE_QUIET: Final = False$/SEE_QUIET: Final = True/",
+  "games": 40,
+  "workers": 4,
+  "base_ms": 120000,
+  "openings": "platform",
+  "elo0": -50,
+  "elo1": 50
+ },
+ {
+  "name": "149-v94wdl",
+  "sed": "s/^CAPTURE_ORDER: Final = False$/CAPTURE_ORDER: Final = True/; s/^QS_TT: Final = False$/QS_TT: Final = True/; s/^ASP_WIDE: Final = False$/ASP_WIDE: Final = True/; s/^NMP_V2B: Final = False$/NMP_V2B: Final = True/",
+  "games": 600,
+  "net": "overnight/nets/157-wdlnet.npz"
+ },
+ {
+  "name": "v9-120s-l",
+  "kind": "switch",
+  "sed": "s/^TIME_V6: Final = False$/TIME_V6: Final = True/; s/^QS_EVAL_CACHE: Final = False$/QS_EVAL_CACHE: Final = True/; s/^ADJUDICATION: Final = False$/ADJUDICATION: Final = True/; s/^HISTORY2_FIX: Final = False$/HISTORY2_FIX: Final = True/; s/^KILLER_CLEAR: Final = False$/KILLER_CLEAR: Final = True/",
+  "games": 40,
+  "workers": 4,
+  "base_ms": 120000,
+  "openings": "platform",
+  "elo0": -50,
+  "elo1": 50
+ },
+ {
+  "name": "v94-120s",
+  "kind": "switch",
+  "sed": "",
+  "champion": "overnight/challengers/153-mixnet2",
+  "games": 40,
+  "workers": 4,
+  "base_ms": 120000,
+  "openings": "platform",
+  "elo0": -50,
+  "elo1": 50
+ }
+]

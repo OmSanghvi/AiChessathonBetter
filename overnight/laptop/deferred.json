@@ -1,0 +1,8 @@
+[
+ {
+  "name": "156-mixnet3",
+  "net": "overnight/nets/156-mixnet3.npz",
+  "sed": "",
+  "games": 600
+ }
+]
