@@ -92,7 +92,7 @@ class Kernel:
         acc = agent.ACC_SIZE
         self.white = np.zeros(acc, np.float32)
         self.black = np.zeros(acc, np.float32)
-        self.astack = np.zeros((fb.MAX_PLY, 2, acc), np.float32)
+        self.astack = np.zeros((fb.ASTACK_ROWS, 2, acc), np.float32)
         self.zones = np.zeros(2, np.int64)
         fb.refresh(
             self.pos.bb, self.pos.sq, self.pos.meta, agent.W1, agent.B1,
@@ -126,7 +126,7 @@ class Kernel:
             score = fs.search(  # type: ignore[call-arg]
                 pos.bb, pos.sq, pos.meta, pos.undo, pos.keys, agent.W1, agent.B1,
                 self.white, self.black, self.astack, self.zones, agent.KING_ZONES,
-                agent._W2T, agent.B2, agent.W3, agent.B3, *self.table,
+                agent._W2T, agent.B2_P, agent.W3_P, agent.B3_P, *self.table,
                 self.killers, self.butterfly, self.moves, self.scores, self.rep,
                 self.ctrl, time.monotonic() + 3600, d, -agent.INFINITY, agent.INFINITY, 0,
                 self.scratch, self.counter, self.quiets, self.ec_key, self.ec_val, self.exts,
@@ -178,7 +178,7 @@ def main() -> None:
     arguments = parser.parse_args()
 
     check_constants()
-    fs.warm_up(agent.W1, agent.B1, agent._W2T, agent.B2, agent.W3, agent.B3, agent.KING_ZONES)
+    fs.warm_up(agent.W1, agent.B1, agent._W2T, agent.B2_P, agent.W3_P, agent.B3_P, agent.KING_ZONES)
     # The kernel does not probe tablebases inside the tree (the root still does),
     # so the reference runs without them too; the root probe is exercised by play.
     agent._TABLEBASE = None
